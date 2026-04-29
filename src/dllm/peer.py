@@ -11,6 +11,7 @@ from typing import Any
 
 from .config import Settings
 from .model import TorchTransformersEngine, request_from_payload
+from .sharding import LayerShard
 
 
 _HEADER = struct.Struct("!Q")
@@ -52,6 +53,7 @@ class PeerClient:
         language_only: bool | None = None,
         language_weight_prefix: str | None = None,
         weight_key_mapping: str | None = None,
+        shard: LayerShard | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"model_name": model_name}
         if device:
@@ -76,6 +78,8 @@ class PeerClient:
             payload["language_weight_prefix"] = language_weight_prefix
         if weight_key_mapping:
             payload["weight_key_mapping"] = weight_key_mapping
+        if shard is not None:
+            payload["shard"] = shard.as_dict()
         return self.send(
             host,
             port,
@@ -88,6 +92,9 @@ class PeerClient:
 
     def generate(self, host: str, port: int, payload: dict[str, Any]) -> dict[str, Any]:
         return self.send(host, port, {"command": "generate", "payload": payload}, timeout=self.timeout)
+
+    def forward_shard(self, host: str, port: int, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.send(host, port, {"command": "forward_shard", "payload": payload}, timeout=self.timeout)
 
     def generate_stream(self, host: str, port: int, payload: dict[str, Any]):
         message = {"command": "generate_stream", "payload": payload}
@@ -192,6 +199,8 @@ class InferenceWorker:
             return self._handle_load_model(payload)
         if command == "generate":
             return self._handle_generate(payload)
+        if command == "forward_shard":
+            return self._handle_forward_shard(payload)
         if command == "generate_stream":
             return {"ok": False, "error": "generate_stream must be handled as a stream"}
         if command == "shutdown":
@@ -229,6 +238,7 @@ class InferenceWorker:
                 payload.get("language_weight_prefix") or self.engine.language_weight_prefix
             ).strip()
             requested_key_mapping = str(payload.get("weight_key_mapping") or self.engine.weight_key_mapping).strip()
+            requested_shard = LayerShard.from_mapping(payload.get("shard"))
 
             same_runtime = (
                 requested_model == self.engine.model_name
@@ -243,6 +253,7 @@ class InferenceWorker:
                 and requested_language_only == self.engine.language_only
                 and requested_language_prefix == self.engine.language_weight_prefix
                 and requested_key_mapping == self.engine.weight_key_mapping
+                and _shard_dict(requested_shard) == _shard_dict(self.engine.shard)
             )
             if not same_runtime:
                 self.engine.unload()
@@ -259,6 +270,7 @@ class InferenceWorker:
                     language_only=requested_language_only,
                     language_weight_prefix=requested_language_prefix,
                     weight_key_mapping=requested_key_mapping,
+                    shard=requested_shard,
                 )
 
             start = time.perf_counter()
@@ -283,6 +295,17 @@ class InferenceWorker:
             "ok": True,
             "payload": {
                 **result.as_dict(),
+                "node_name": self.settings.node_name,
+            },
+        }
+
+    def _handle_forward_shard(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._engine_lock:
+            result = self.engine.forward_shard(payload)
+        return {
+            "ok": True,
+            "payload": {
+                **result,
                 "node_name": self.settings.node_name,
             },
         }
@@ -400,6 +423,10 @@ def _message_content_to_text(content: Any) -> str:
             return str(content.get("text", ""))
         return json.dumps(content, separators=(",", ":"), default=str)
     return str(content)
+
+
+def _shard_dict(shard: LayerShard | None) -> dict[str, Any] | None:
+    return shard.as_dict() if shard is not None else None
 
 
 def _write_message(sock: socket.socket, body: bytes) -> None:

@@ -90,6 +90,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="include this process as a local generation target",
     )
     serve.add_argument(
+        "--distribution-mode",
+        choices=("shard", "replica"),
+        default=None,
+        help="shard one request across server+peers, or replica-load-balance full requests",
+    )
+    serve.add_argument(
         "--offline",
         action=argparse.BooleanOptionalAction,
         default=None,

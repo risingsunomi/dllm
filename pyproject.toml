@@ -4,20 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dllm"
-version = "0.1.0"
-description = "Standalone distributed PyTorch inference server"
+version = "0.2.0"
+description = "Standalone sharded distributed PyTorch inference server"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
+keywords = ["pytorch", "transformers", "distributed-inference", "sharding", "openai-api"]
 dependencies = [
   "torch>=2.1",
   "transformers>=4.57.1",
   "accelerate>=0.26",
   "safetensors>=0.4",
-  "huggingface_hub>=1.12.0",
+  "huggingface_hub>=0.24",
 ]
 classifiers = [
   "License :: OSI Approved :: Apache Software License",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
 ]

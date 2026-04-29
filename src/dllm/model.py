@@ -4,11 +4,14 @@ import json
 import re
 import time
 import threading
+import base64
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Thread
 from typing import Any
 
+from .sharding import LayerShard
 from .tools import normalize_tools, tool_system_prompt
 
 
@@ -96,6 +99,7 @@ class TorchTransformersEngine:
         language_only: bool = True,
         language_weight_prefix: str = "auto",
         weight_key_mapping: str = "",
+        shard: LayerShard | None = None,
     ) -> None:
         self.model_name = model_name
         self.requested_device = device
@@ -109,6 +113,7 @@ class TorchTransformersEngine:
         self.language_only = bool(language_only)
         self.language_weight_prefix = str(language_weight_prefix or "auto")
         self.weight_key_mapping = str(weight_key_mapping or "")
+        self.shard = shard
         self.model: Any | None = None
         self.tokenizer: Any | None = None
         self.model_config: dict[str, Any] = {}
@@ -185,6 +190,8 @@ class TorchTransformersEngine:
                 self.model_name,
                 **model_kwargs,
             )
+            if self.shard is not None:
+                _apply_loaded_shard(model, self.shard, torch)
             if device_map is None:
                 model.to(device)
             model.eval()
@@ -212,6 +219,15 @@ class TorchTransformersEngine:
                 _import_torch().cuda.empty_cache()
             except Exception:
                 pass
+
+    def set_shard(self, shard: LayerShard | None) -> None:
+        with self._lock:
+            current = self.shard.as_dict() if self.shard is not None else None
+            requested = shard.as_dict() if shard is not None else None
+            if current == requested:
+                return
+            self.unload()
+            self.shard = shard
 
     def format_chat_prompt(
         self,
@@ -408,6 +424,121 @@ class TorchTransformersEngine:
                 device=self.device,
             ).as_dict()
 
+    def encode_inputs(self, prompt: str) -> dict[str, Any]:
+        self.load()
+        assert self.tokenizer is not None
+        torch = _import_torch()
+
+        with self._lock:
+            encoded = self.tokenizer(str(prompt), return_tensors="pt")
+            input_ids = encoded["input_ids"].to(self.input_device, dtype=torch.long)
+            attention_mask = encoded.get("attention_mask")
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+            else:
+                attention_mask = attention_mask.to(self.input_device, dtype=torch.long)
+            position_ids = _position_ids_from_attention(attention_mask, torch)
+            return {
+                "input_ids": _encode_tensor(input_ids),
+                "attention_mask": _encode_tensor(attention_mask),
+                "position_ids": _encode_tensor(position_ids),
+                "prompt_tokens": int(input_ids.shape[-1]),
+                "seen_tokens": [int(value) for value in input_ids.detach().cpu().reshape(-1).tolist()],
+            }
+
+    def append_token_to_inputs(self, encoded_inputs: dict[str, Any], token_id: int) -> dict[str, Any]:
+        self.load()
+        torch = _import_torch()
+        with self._lock:
+            input_ids = _decode_tensor(encoded_inputs.get("input_ids"), torch, self.input_device)
+            attention_mask = _decode_tensor(encoded_inputs.get("attention_mask"), torch, self.input_device)
+            if input_ids is None or attention_mask is None:
+                raise ValueError("encoded input_ids and attention_mask are required")
+            next_token = torch.tensor([[int(token_id)]], device=self.input_device, dtype=torch.long)
+            input_ids = torch.cat((input_ids.to(dtype=torch.long), next_token), dim=1)
+            next_mask = torch.ones((attention_mask.shape[0], 1), device=self.input_device, dtype=torch.long)
+            attention_mask = torch.cat((attention_mask.to(dtype=torch.long), next_mask), dim=1)
+            position_ids = _position_ids_from_attention(attention_mask, torch)
+            return {
+                "input_ids": _encode_tensor(input_ids),
+                "attention_mask": _encode_tensor(attention_mask),
+                "position_ids": _encode_tensor(position_ids),
+                "prompt_tokens": int(encoded_inputs.get("prompt_tokens", input_ids.shape[-1])),
+                "seen_tokens": [int(value) for value in input_ids.detach().cpu().reshape(-1).tolist()],
+            }
+
+    def decode_token_ids(self, token_ids: list[int]) -> str:
+        self.load()
+        assert self.tokenizer is not None
+        return self.tokenizer.decode([int(token_id) for token_id in token_ids], skip_special_tokens=True)
+
+    def forward_shard(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.load()
+        assert self.model is not None
+        assert self.tokenizer is not None
+        if self.shard is None:
+            raise RuntimeError("forward_shard requires an assigned layer shard")
+
+        torch = _import_torch()
+        request = request_from_payload(payload, {})
+        seen_tokens = _int_list(payload.get("seen_tokens", []))
+
+        with self._lock:
+            input_ids = _decode_tensor(payload.get("input_ids"), torch, self.input_device)
+            attention_mask = _decode_tensor(payload.get("attention_mask"), torch, self.input_device)
+            position_ids = _decode_tensor(payload.get("position_ids"), torch, self.input_device)
+            hidden_state = _decode_tensor(payload.get("hidden_state"), torch, self.input_device)
+
+            if input_ids is not None:
+                input_ids = input_ids.to(self.input_device, dtype=torch.long)
+            if attention_mask is None:
+                if input_ids is None:
+                    raise ValueError("attention_mask is required when forwarding a hidden_state")
+                attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+            else:
+                attention_mask = attention_mask.to(self.input_device, dtype=torch.long)
+            if position_ids is None:
+                position_ids = _position_ids_from_attention(attention_mask, torch)
+            else:
+                position_ids = position_ids.to(self.input_device, dtype=torch.long)
+            if hidden_state is not None:
+                hidden_state = hidden_state.to(self.input_device)
+
+            start = time.perf_counter()
+            with torch.inference_mode():
+                output = _run_loaded_shard(
+                    self.model,
+                    shard=self.shard,
+                    input_ids=input_ids,
+                    hidden_state=hidden_state,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                )
+                elapsed = time.perf_counter() - start
+
+                if not self.shard.is_final:
+                    return {
+                        "hidden_state": _encode_tensor(output),
+                        "attention_mask": _encode_tensor(attention_mask),
+                        "position_ids": _encode_tensor(position_ids),
+                        "shard": self.shard.as_dict(),
+                        "elapsed_seconds": elapsed,
+                    }
+
+                token_id = _sample_next_token(
+                    output[:, -1, :],
+                    request,
+                    seen_tokens=seen_tokens,
+                    torch=torch,
+                )
+                eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+                return {
+                    "token_id": int(token_id),
+                    "end_token": eos_token_id is not None and int(token_id) == int(eos_token_id),
+                    "shard": self.shard.as_dict(),
+                    "elapsed_seconds": elapsed,
+                }
+
     def health(self) -> dict[str, Any]:
         return {
             "model_name": self.model_name,
@@ -423,6 +554,7 @@ class TorchTransformersEngine:
             "language_weight_prefix": self.language_weight_prefix,
             "weight_key_mapping": self.weight_key_mapping,
             "language_loading": self.language_loading,
+            "shard": self.shard.as_dict() if self.shard is not None else None,
             "loaded": self.loaded,
             "offline": self.offline,
             "model_type": self.model_config.get("model_type", ""),
@@ -451,6 +583,263 @@ def request_from_payload(payload: dict[str, Any], defaults: dict[str, Any]) -> G
         ),
         stop=stop,
     )
+
+
+def _encode_tensor(tensor: Any) -> dict[str, Any]:
+    try:
+        from safetensors.torch import save
+    except Exception as exc:
+        raise RuntimeError("safetensors is required for sharded tensor transport") from exc
+    payload = save({"tensor": tensor.detach().cpu().contiguous()})
+    return {
+        "format": "safetensors",
+        "buffer": base64.b64encode(payload).decode("ascii"),
+        "shape": [int(dim) for dim in tensor.shape],
+        "dtype": str(tensor.dtype).replace("torch.", ""),
+    }
+
+
+def _decode_tensor(payload: Any, torch: Any, device: str) -> Any | None:
+    if not isinstance(payload, dict):
+        return None
+    buffer = payload.get("buffer")
+    if not isinstance(buffer, str) or not buffer:
+        return None
+    if str(payload.get("format", "safetensors")) != "safetensors":
+        raise ValueError("unsupported tensor payload format")
+    try:
+        from safetensors.torch import load
+    except Exception as exc:
+        raise RuntimeError("safetensors is required for sharded tensor transport") from exc
+    tensors = load(base64.b64decode(buffer.encode("ascii")))
+    tensor = tensors.get("tensor")
+    if tensor is None:
+        return None
+    return tensor.to(device)
+
+
+def _position_ids_from_attention(attention_mask: Any, torch: Any) -> Any:
+    mask = attention_mask.to(dtype=torch.long)
+    return (mask.cumsum(dim=1) - 1).clamp(min=0) * mask
+
+
+def _run_loaded_shard(
+    model: Any,
+    *,
+    shard: LayerShard,
+    input_ids: Any | None,
+    hidden_state: Any | None,
+    attention_mask: Any,
+    position_ids: Any,
+) -> Any:
+    base_model = _causal_base_model(model)
+    kwargs: dict[str, Any] = {
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "use_cache": False,
+        "output_attentions": False,
+        "output_hidden_states": False,
+        "return_dict": True,
+    }
+    if hidden_state is not None:
+        kwargs["inputs_embeds"] = hidden_state
+    else:
+        if input_ids is None:
+            raise ValueError("input_ids is required for the first shard")
+        kwargs["input_ids"] = input_ids
+
+    outputs = _call_with_supported_kwargs(base_model, kwargs)
+    hidden = _last_hidden_state(outputs)
+    if not shard.is_final:
+        return hidden
+
+    output_embeddings = _output_embeddings(model)
+    if output_embeddings is None:
+        raise RuntimeError("model does not expose output embeddings for final shard sampling")
+    return output_embeddings(hidden)
+
+
+def _apply_loaded_shard(model: Any, shard: LayerShard, torch: Any) -> None:
+    layer_info = _decoder_layers(model)
+    if layer_info is None:
+        raise RuntimeError("could not locate decoder layers for sharded loading")
+    _, layers = layer_info
+    start = max(int(shard.start_layer), 0)
+    end = min(int(shard.end_layer), len(layers))
+    if start > end:
+        raise RuntimeError(f"invalid shard range {start}:{end} for {len(layers)} decoder layers")
+
+    for index in range(len(layers)):
+        if start <= index < end:
+            continue
+        layers[index] = _passthrough_decoder_layer(torch)
+
+    if not shard.is_final:
+        norm_info = _final_norm_module(model)
+        if norm_info is not None:
+            parent, name = norm_info
+            setattr(parent, name, torch.nn.Identity())
+
+
+def _passthrough_decoder_layer(torch: Any) -> Any:
+    class PassthroughDecoderLayer(torch.nn.Module):
+        def forward(self, hidden_states: Any, *args: Any, **kwargs: Any) -> tuple[Any]:
+            del args, kwargs
+            return (hidden_states,)
+
+    return PassthroughDecoderLayer()
+
+
+def _causal_base_model(model: Any) -> Any:
+    base_model_prefix = getattr(model, "base_model_prefix", "")
+    if base_model_prefix:
+        candidate = getattr(model, base_model_prefix, None)
+        if candidate is not None:
+            return candidate
+    for attr in ("model", "transformer", "gpt_neox", "base_model"):
+        candidate = getattr(model, attr, None)
+        if candidate is not None and candidate is not model:
+            return candidate
+    return model
+
+
+def _decoder_layers(model: Any) -> tuple[Any, Any] | None:
+    for path in (
+        "model.layers",
+        "model.decoder.layers",
+        "model.model.layers",
+        "transformer.h",
+        "gpt_neox.layers",
+        "base_model.layers",
+    ):
+        resolved = _resolve_parent_attr(model, path)
+        if resolved is None:
+            continue
+        parent, name = resolved
+        layers = getattr(parent, name, None)
+        if layers is not None and hasattr(layers, "__len__") and hasattr(layers, "__setitem__"):
+            return parent, layers
+    return None
+
+
+def _final_norm_module(model: Any) -> tuple[Any, str] | None:
+    for path in (
+        "model.norm",
+        "model.decoder.final_layer_norm",
+        "model.final_layernorm",
+        "transformer.ln_f",
+        "gpt_neox.final_layer_norm",
+        "base_model.norm",
+    ):
+        resolved = _resolve_parent_attr(model, path)
+        if resolved is None:
+            continue
+        parent, name = resolved
+        if getattr(parent, name, None) is not None:
+            return parent, name
+    return None
+
+
+def _resolve_parent_attr(root: Any, path: str) -> tuple[Any, str] | None:
+    parts = [part for part in path.split(".") if part]
+    if not parts:
+        return None
+    parent = root
+    for part in parts[:-1]:
+        parent = getattr(parent, part, None)
+        if parent is None:
+            return None
+    return parent, parts[-1]
+
+
+def _call_with_supported_kwargs(module: Any, kwargs: dict[str, Any]) -> Any:
+    forward = getattr(module, "forward", module)
+    try:
+        signature = inspect.signature(forward)
+    except (TypeError, ValueError):
+        return module(**kwargs)
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return module(**kwargs)
+    accepted = {name for name in signature.parameters}
+    return module(**{key: value for key, value in kwargs.items() if key in accepted})
+
+
+def _last_hidden_state(outputs: Any) -> Any:
+    hidden = getattr(outputs, "last_hidden_state", None)
+    if hidden is not None:
+        return hidden
+    if isinstance(outputs, (tuple, list)) and outputs:
+        return outputs[0]
+    raise RuntimeError("shard forward did not return hidden states")
+
+
+def _output_embeddings(model: Any) -> Any | None:
+    getter = getattr(model, "get_output_embeddings", None)
+    if callable(getter):
+        output = getter()
+        if output is not None:
+            return output
+    for attr in ("lm_head", "embed_out", "output"):
+        output = getattr(model, attr, None)
+        if output is not None:
+            return output
+    return None
+
+
+def _sample_next_token(
+    logits: Any,
+    request: GenerationRequest,
+    *,
+    seen_tokens: list[int],
+    torch: Any,
+) -> int:
+    scores = logits[0].detach().float().clone()
+    penalty = max(float(request.repetition_penalty), 0.01)
+    if penalty != 1.0 and seen_tokens:
+        vocab_size = int(scores.shape[-1])
+        for token_id in set(seen_tokens):
+            if 0 <= int(token_id) < vocab_size:
+                if scores[token_id] < 0:
+                    scores[token_id] *= penalty
+                else:
+                    scores[token_id] /= penalty
+
+    temperature = float(request.temperature)
+    if temperature <= 0:
+        return int(torch.argmax(scores).item())
+
+    scores = scores / max(temperature, 1e-5)
+    top_k = int(request.top_k)
+    if top_k > 0 and top_k < int(scores.shape[-1]):
+        threshold = torch.topk(scores, top_k).values[-1]
+        scores = scores.masked_fill(scores < threshold, float("-inf"))
+
+    top_p = min(max(float(request.top_p), 0.0), 1.0)
+    if 0 < top_p < 1:
+        sorted_scores, sorted_indices = torch.sort(scores, descending=True)
+        sorted_probs = torch.softmax(sorted_scores, dim=-1)
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        remove = cumulative > top_p
+        remove[1:] = remove[:-1].clone()
+        remove[0] = False
+        scores[sorted_indices[remove]] = float("-inf")
+
+    probs = torch.softmax(scores, dim=-1)
+    if not torch.isfinite(probs).all() or float(probs.sum().item()) <= 0:
+        return int(torch.argmax(logits[0]).item())
+    return int(torch.multinomial(probs, num_samples=1).item())
+
+
+def _int_list(value: Any) -> list[int]:
+    if not isinstance(value, list):
+        return []
+    result: list[int] = []
+    for item in value:
+        try:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 class _StopFilter:

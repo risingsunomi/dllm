@@ -8,6 +8,7 @@ from typing import Any
 from .config import PeerSpec, Settings
 from .model import TorchTransformersEngine, request_from_payload
 from .peer import PeerClient, _payload_with_prompt
+from .sharding import LayerShard, build_layer_shards, total_layers_from_config
 
 
 @dataclass
@@ -17,6 +18,7 @@ class PeerState:
     loaded: bool = False
     last_error: str = ""
     last_seen: float = 0.0
+    shard: LayerShard | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -25,15 +27,16 @@ class PeerState:
             "loaded": self.loaded,
             "last_error": self.last_error,
             "last_seen": self.last_seen,
+            "shard": self.shard.as_dict() if self.shard is not None else None,
         }
 
 
 class DistributedInferenceEngine:
     """Coordinator for local or multi-node inference.
 
-    Multiple nodes are used as distributed serving workers. Each request is sent
-    to one available worker, while concurrent requests can be spread across the
-    configured peer set by the coordinator.
+    In shard mode, one request flows through the server's local layer shard and
+    then each peer shard. Replica mode keeps the older full-request worker
+    load-balancing behavior.
     """
 
     def __init__(
@@ -64,6 +67,7 @@ class DistributedInferenceEngine:
             connect_timeout=settings.peer_connect_timeout,
         )
         self.peers = [PeerState(spec=peer) for peer in settings.peers]
+        self.local_shard: LayerShard | None = None
         self._rr = 0
         self._lock = threading.RLock()
         self._ready = False
@@ -73,9 +77,12 @@ class DistributedInferenceEngine:
             if self._ready:
                 return
             errors: list[str] = []
+            self._plan_shards()
             if self.local_engine is not None:
                 self.local_engine.load()
             for peer in self.peers:
+                if self._using_shards() and peer.shard is None:
+                    continue
                 try:
                     self._load_peer(peer)
                 except Exception as exc:
@@ -87,6 +94,8 @@ class DistributedInferenceEngine:
 
     def generate(self, payload: dict[str, Any]) -> dict[str, Any]:
         self.ensure_ready()
+        if self._using_shards():
+            return self._generate_sharded(payload)
         errors: list[str] = []
         for target in self._target_order():
             if target == "local":
@@ -117,6 +126,9 @@ class DistributedInferenceEngine:
 
     def stream(self, payload: dict[str, Any]):
         self.ensure_ready()
+        if self._using_shards():
+            yield from self._stream_sharded(payload)
+            return
         errors: list[str] = []
         for target in self._target_order():
             if target == "local":
@@ -157,6 +169,8 @@ class DistributedInferenceEngine:
             "model_name": self.settings.model_name,
             "device": self.settings.device,
             "ready": self._ready,
+            "distribution_mode": self.settings.distribution_mode,
+            "local_shard": self.local_shard.as_dict() if self.local_shard is not None else None,
             "local": self.local_engine.health() if self.local_engine is not None else None,
             "peers": [peer.as_dict() for peer in self.peers],
         }
@@ -185,6 +199,12 @@ class DistributedInferenceEngine:
                 peer.spec.host,
                 peer.spec.port,
                 model_name=self.settings.model_name,
+                offline=self.settings.offline,
+                trust_remote_code=self.settings.trust_remote_code,
+                language_only=self.settings.language_only,
+                language_weight_prefix=self.settings.language_weight_prefix,
+                weight_key_mapping=self.settings.weight_key_mapping,
+                shard=peer.shard,
             )
             peer.healthy = True
             peer.loaded = True
@@ -197,6 +217,156 @@ class DistributedInferenceEngine:
             peer.loaded = False
             peer.last_error = str(exc)
             raise
+
+    def _plan_shards(self) -> None:
+        if self.settings.distribution_mode != "shard" or not self.peers or self.local_engine is None:
+            self.local_shard = None
+            if self.local_engine is not None:
+                self.local_engine.set_shard(None)
+            for peer in self.peers:
+                peer.shard = None
+            return
+
+        total_layers = self._total_layers()
+        node_names = [self.settings.node_name, *[peer.spec.name for peer in self.peers]]
+        plan = build_layer_shards(
+            model_name=self.settings.model_name,
+            total_layers=total_layers,
+            node_names=node_names,
+        )
+        if len(plan) <= 1:
+            self.local_shard = None
+            self.local_engine.set_shard(None)
+            for peer in self.peers:
+                peer.shard = None
+            return
+
+        self.local_shard = plan[0]
+        self.local_engine.set_shard(self.local_shard)
+        remote_plan = plan[1:]
+        for index, peer in enumerate(self.peers):
+            peer.shard = remote_plan[index] if index < len(remote_plan) else None
+
+    def _total_layers(self) -> int:
+        try:
+            from transformers import AutoConfig
+        except Exception as exc:
+            raise RuntimeError("transformers is required for sharded layer planning") from exc
+        config = AutoConfig.from_pretrained(
+            self.settings.model_name,
+            local_files_only=self.settings.offline,
+            trust_remote_code=self.settings.trust_remote_code,
+        )
+        total_layers = total_layers_from_config(config)
+        if total_layers <= 1:
+            raise RuntimeError("model config does not expose num_hidden_layers for sharding")
+        return total_layers
+
+    def _using_shards(self) -> bool:
+        return self.local_shard is not None and any(peer.shard is not None for peer in self.peers)
+
+    def _shard_peers(self) -> list[PeerState]:
+        return [peer for peer in self.peers if peer.shard is not None and peer.loaded]
+
+    def _generate_sharded(self, payload: dict[str, Any]) -> dict[str, Any]:
+        events = list(self._run_sharded(payload, emit_tokens=False))
+        done = events[-1] if events else {}
+        return dict(done)
+
+    def _stream_sharded(self, payload: dict[str, Any]):
+        yield from self._run_sharded(payload, emit_tokens=True)
+
+    def _run_sharded(self, payload: dict[str, Any], *, emit_tokens: bool):
+        if self.local_engine is None:
+            raise RuntimeError("sharded inference requires a local server shard")
+
+        request_payload = _payload_with_prompt(
+            self.local_engine,
+            payload,
+            self.settings.generation_defaults(),
+        )
+        request = request_from_payload(request_payload, self.settings.generation_defaults())
+        encoded_inputs = self.local_engine.encode_inputs(request.prompt)
+        prompt_tokens = int(encoded_inputs.get("prompt_tokens", 0))
+        seen_tokens = list(encoded_inputs.get("seen_tokens", []))
+        token_ids: list[int] = []
+        text_parts: list[str] = []
+        stop_filter = _ShardStopFilter(request.stop)
+        start = time.perf_counter()
+
+        for _ in range(max(int(request.max_new_tokens), 1)):
+            stage_payload: dict[str, Any] = {
+                **request_payload,
+                "input_ids": encoded_inputs["input_ids"],
+                "attention_mask": encoded_inputs["attention_mask"],
+                "position_ids": encoded_inputs["position_ids"],
+                "seen_tokens": seen_tokens,
+            }
+            result = self.local_engine.forward_shard(stage_payload)
+            for peer in self._shard_peers():
+                result = self._forward_peer_shard(peer, {**stage_payload, **_next_shard_payload(result)})
+
+            if "token_id" not in result:
+                raise RuntimeError("sharded inference ended without a final token")
+
+            token_id = int(result["token_id"])
+            token_ids.append(token_id)
+            seen_tokens.append(token_id)
+            piece = self.local_engine.decode_token_ids([token_id])
+            filtered = stop_filter.push(piece)
+            if filtered:
+                text_parts.append(filtered)
+                if emit_tokens:
+                    yield {"event": "token", "text": filtered}
+
+            if bool(result.get("end_token")) or stop_filter.stopped:
+                break
+            encoded_inputs = self.local_engine.append_token_to_inputs(encoded_inputs, token_id)
+
+        trailing = stop_filter.finish()
+        if trailing:
+            text_parts.append(trailing)
+            if emit_tokens:
+                yield {"event": "token", "text": trailing}
+
+        elapsed = time.perf_counter() - start
+        done = {
+            "event": "done",
+            "text": "".join(text_parts),
+            "generated_tokens": len(token_ids),
+            "prompt_tokens": prompt_tokens,
+            "elapsed_seconds": elapsed,
+            "tokens_per_second": (len(token_ids) / elapsed) if elapsed > 0 else 0.0,
+            "model_name": self.settings.model_name,
+            "device": self.settings.device,
+            "node_name": self.settings.node_name,
+            "target": "sharded",
+            "distributed": True,
+            "shards": self._shard_summary(),
+        }
+        yield done
+
+    def _forward_peer_shard(self, peer: PeerState, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            response = self.peer_client.forward_shard(peer.spec.host, peer.spec.port, payload)
+            peer.healthy = True
+            peer.loaded = True
+            peer.last_error = ""
+            peer.last_seen = time.time()
+            return dict(response.get("payload", {}))
+        except Exception as exc:
+            peer.healthy = False
+            peer.last_error = str(exc)
+            raise
+
+    def _shard_summary(self) -> list[dict[str, Any]]:
+        summary: list[dict[str, Any]] = []
+        if self.local_shard is not None:
+            summary.append({"node_name": self.settings.node_name, "shard": self.local_shard.as_dict()})
+        for peer in self.peers:
+            if peer.shard is not None:
+                summary.append({"node_name": peer.spec.name, "shard": peer.shard.as_dict()})
+        return summary
 
     def _target_order(self) -> list[str | PeerState]:
         with self._lock:
@@ -242,3 +412,62 @@ class DistributedInferenceEngine:
                 event_out["target"] = "local"
                 event_out["distributed"] = len(self.peers) > 0
             yield event_out
+
+
+def _next_shard_payload(result: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for key in ("hidden_state", "attention_mask", "position_ids"):
+        if key in result:
+            payload[key] = result[key]
+    return payload
+
+
+class _ShardStopFilter:
+    def __init__(self, stop: tuple[str, ...]) -> None:
+        self.stop = tuple(marker for marker in stop if marker)
+        self.pending = ""
+        self.stopped = False
+
+    def push(self, text: str) -> str:
+        if self.stopped:
+            return ""
+        if not self.stop:
+            return text
+        self.pending += text
+        stop_index = _first_stop_index(self.pending, self.stop)
+        if stop_index is not None:
+            output = self.pending[:stop_index]
+            self.pending = ""
+            self.stopped = True
+            return output
+        keep = _longest_stop_prefix_suffix(self.pending, self.stop)
+        if keep <= 0:
+            output = self.pending
+            self.pending = ""
+            return output
+        output = self.pending[:-keep]
+        self.pending = self.pending[-keep:]
+        return output
+
+    def finish(self) -> str:
+        if self.stopped:
+            return ""
+        output = self.pending
+        self.pending = ""
+        return output
+
+
+def _first_stop_index(text: str, stop: tuple[str, ...]) -> int | None:
+    indexes = [text.find(marker) for marker in stop if marker and text.find(marker) >= 0]
+    return min(indexes) if indexes else None
+
+
+def _longest_stop_prefix_suffix(text: str, stop: tuple[str, ...]) -> int:
+    longest = 0
+    for marker in stop:
+        max_len = min(len(marker) - 1, len(text))
+        for size in range(max_len, 0, -1):
+            if text.endswith(marker[:size]):
+                longest = max(longest, size)
+                break
+    return longest
