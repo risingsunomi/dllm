@@ -1,6 +1,6 @@
 # dllm
 
-Standalone distributed PyTorch inference server. It does not import Cheetah at runtime; the implementation is a small server and peer engine in this repository.
+Standalone distributed inference server using PyTorch. Supports MoE, Non-MoE and language part only of vision language models.
 
 ## Install
 
