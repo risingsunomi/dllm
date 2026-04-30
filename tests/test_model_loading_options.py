@@ -4,6 +4,7 @@ import unittest
 
 from dllm.model import (
     _auto_weight_key_mapping,
+    _cast_floating_tensor,
     _key_mapping_for_prefixes,
     _last_hidden_state,
     _moe_metadata,
@@ -16,6 +17,23 @@ from dllm.model import (
 
 
 class ModelLoadingOptionsTests(unittest.TestCase):
+    def test_cast_floating_tensor_uses_target_dtype(self) -> None:
+        class FakeTensor:
+            def __init__(self) -> None:
+                self.dtype = "float32"
+                self.requested_dtype = None
+
+            def is_floating_point(self) -> bool:
+                return True
+
+            def to(self, *, dtype=None):
+                self.requested_dtype = dtype
+                return self
+
+        tensor = FakeTensor()
+        self.assertIs(_cast_floating_tensor(tensor, dtype="bfloat16"), tensor)
+        self.assertEqual(tensor.requested_dtype, "bfloat16")
+
     def test_last_hidden_state_unwraps_nested_tuples(self) -> None:
         class FakeTensor:
             shape = (1, 2, 3)

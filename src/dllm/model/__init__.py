@@ -542,7 +542,10 @@ class TorchTransformersEngine:
             else:
                 position_ids = position_ids.to(self.input_device, dtype=torch.long)
             if hidden_state is not None:
-                hidden_state = hidden_state.to(self.input_device)
+                hidden_state = _cast_floating_tensor(
+                    hidden_state.to(self.input_device),
+                    dtype=_model_forward_dtype(self.model),
+                )
 
             start = time.perf_counter()
             with torch.inference_mode():
@@ -685,7 +688,10 @@ def _run_loaded_shard(
         "return_dict": True,
     }
     if hidden_state is not None:
-        kwargs["inputs_embeds"] = hidden_state
+        kwargs["inputs_embeds"] = _cast_floating_tensor(
+            hidden_state,
+            dtype=_model_forward_dtype(base_model) or _model_forward_dtype(model),
+        )
     else:
         if input_ids is None:
             raise ValueError("input_ids is required for the first shard")
@@ -693,12 +699,17 @@ def _run_loaded_shard(
 
     outputs = _call_with_supported_kwargs(base_model, kwargs)
     hidden = _last_hidden_state(outputs)
+    hidden = _cast_floating_tensor(
+        hidden,
+        dtype=_model_forward_dtype(base_model) or _model_forward_dtype(model),
+    )
     if not shard.is_final:
         return hidden
 
     output_embeddings = _output_embeddings(model)
     if output_embeddings is None:
         raise RuntimeError("model does not expose output embeddings for final shard sampling")
+    hidden = _cast_floating_tensor(hidden, dtype=_module_forward_dtype(output_embeddings))
     return output_embeddings(hidden)
 
 
@@ -848,6 +859,47 @@ def _first_tensor(value: Any) -> Any | None:
 
 def _is_tensor_like(value: Any) -> bool:
     return all(hasattr(value, attr) for attr in ("detach", "shape", "dtype"))
+
+
+def _cast_floating_tensor(tensor: Any, *, dtype: Any | None) -> Any:
+    if dtype is None or tensor is None or not _tensor_is_floating(tensor):
+        return tensor
+    try:
+        if getattr(tensor, "dtype", None) == dtype:
+            return tensor
+        return tensor.to(dtype=dtype)
+    except Exception:
+        return tensor
+
+
+def _tensor_is_floating(tensor: Any) -> bool:
+    checker = getattr(tensor, "is_floating_point", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            pass
+    dtype = getattr(tensor, "dtype", None)
+    return bool(getattr(dtype, "is_floating_point", False))
+
+
+def _model_forward_dtype(model: Any) -> Any | None:
+    return _module_forward_dtype(_causal_base_model(model)) or _module_forward_dtype(model)
+
+
+def _module_forward_dtype(module: Any) -> Any | None:
+    parameters = getattr(module, "parameters", None)
+    if not callable(parameters):
+        return None
+    try:
+        iterator = parameters()
+    except Exception:
+        return None
+    for parameter in iterator:
+        dtype = getattr(parameter, "dtype", None)
+        if bool(getattr(dtype, "is_floating_point", False)):
+            return dtype
+    return None
 
 
 def _output_embeddings(model: Any) -> Any | None:
