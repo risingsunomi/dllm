@@ -29,7 +29,7 @@ class PeerSpec:
 class Settings:
     model_name: str = ""
     node_name: str = field(default_factory=socket.gethostname)
-    device: str = "cpu"
+    device: str = "auto"
     role: str = "server"
     host: str = "0.0.0.0"
     port: int = 8000
@@ -80,7 +80,7 @@ class Settings:
         return cls(
             model_name=model_name,
             node_name=str(pick("node_name", "DLLM_NODE_NAME", socket.gethostname()) or socket.gethostname()),
-            device=str(pick("device", "DLLM_DEVICE", "cpu") or "cpu"),
+            device=str(pick("device", "DLLM_DEVICE", "auto") or "auto"),
             role=role,
             host=str(pick("host", "DLLM_HOST", "0.0.0.0") or "0.0.0.0"),
             port=_int(pick("port", "DLLM_PORT", 8000), 8000),

@@ -42,7 +42,7 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--env-file", default=".env", help="path to .env file")
     serve.add_argument("--model-name", default=None, help="Hugging Face model id or local path")
     serve.add_argument("--node-name", default=None, help="stable name for this node")
-    serve.add_argument("--device", default=None, help="cpu, cuda, cuda:0, mps, metal, or auto")
+    serve.add_argument("--device", default=None, help="auto, cpu, cuda, cuda:0, mps, or metal")
     serve.add_argument("--dtype", default=None, help="auto, fp32, fp16, bf16, or default")
     serve.add_argument(
         "--device-map",

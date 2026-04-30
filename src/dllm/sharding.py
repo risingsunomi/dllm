@@ -63,6 +63,7 @@ def build_layer_shards(
     model_name: str,
     total_layers: int,
     node_names: Iterable[str],
+    node_weights: Iterable[float] | None = None,
     prefill_tokens: int = 0,
     decode_tokens: int = 0,
 ) -> list[LayerShard]:
@@ -72,12 +73,16 @@ def build_layer_shards(
         return []
 
     names = names[: min(len(names), transformer_layers)]
-    spans = _prefill_weighted_spans(
-        transformer_layers=transformer_layers,
-        parts=len(names),
-        prefill_tokens=prefill_tokens,
-        decode_tokens=decode_tokens,
-    )
+    weights = _normalized_weights(node_weights, len(names))
+    if weights:
+        spans = _capacity_weighted_spans(transformer_layers=transformer_layers, weights=weights)
+    else:
+        spans = _prefill_weighted_spans(
+            transformer_layers=transformer_layers,
+            parts=len(names),
+            prefill_tokens=prefill_tokens,
+            decode_tokens=decode_tokens,
+        )
     shards: list[LayerShard] = []
     start = 0
     for index, name in enumerate(names):
@@ -94,6 +99,48 @@ def build_layer_shards(
         )
         start = end
     return shards
+
+
+def _normalized_weights(values: Iterable[float] | None, parts: int) -> list[float]:
+    if values is None:
+        return []
+    weights: list[float] = []
+    for value in values:
+        try:
+            weight = float(value)
+        except (TypeError, ValueError):
+            weight = 0.0
+        weights.append(max(weight, 0.0))
+    if len(weights) < parts:
+        weights.extend([1.0] * (parts - len(weights)))
+    weights = weights[:parts]
+    if parts <= 1 or sum(weights) <= 0:
+        return []
+    return [weight if weight > 0 else 0.01 for weight in weights]
+
+
+def _capacity_weighted_spans(*, transformer_layers: int, weights: list[float]) -> list[int]:
+    parts = len(weights)
+    layers = max(int(transformer_layers), 0)
+    if parts <= 0:
+        return []
+    if parts == 1:
+        return [layers]
+    if layers <= parts:
+        return [1 if index < layers else 0 for index in range(parts)]
+
+    total_weight = sum(weights)
+    raw = [layers * (weight / total_weight) for weight in weights]
+    spans = [max(1, int(value)) for value in raw]
+    while sum(spans) > layers:
+        index = max(range(parts), key=lambda item: (spans[item], -weights[item]))
+        if spans[index] <= 1:
+            break
+        spans[index] -= 1
+    while sum(spans) < layers:
+        index = max(range(parts), key=lambda item: (raw[item] - spans[item], weights[item]))
+        spans[index] += 1
+    return spans
 
 
 def _prefill_weighted_spans(

@@ -169,34 +169,44 @@ Local servers can skip the API key. If you want Hermes to auto-detect context le
 
 Multi-node execution is layer sharded. The server node is the first shard and owns the HTTP API; peer nodes load later contiguous transformer layer ranges. During generation, hidden states flow from the server shard through each peer shard, and the final shard applies norm/lm_head and samples the next token.
 
-Startup does not load model weights on either server or worker nodes. On the first inference request, the server formats the prompt, counts prefill tokens, builds a prefill/decode-aware shard plan, and sends each worker only its shard assignment. Each node then loads and keeps only its assigned shard when that shard is first executed.
+Startup does not load model weights on either server or worker nodes. On the first inference request, the server formats the prompt, counts prefill tokens, probes peer hardware, builds a shard plan from detected CPU/GPU memory, and sends each worker only its shard assignment. Each node then builds the Transformers model on `meta` and loads only the safetensor keys needed for its assigned shard.
 
-Start peer nodes. Peers respond to LAN discovery by default:
+`--device-map` and `--max-memory` are single-process Transformers placement options. They are useful for one node, but they do not distribute a model across machines. For multi-node runs, start workers and pass them to the server as peers.
+
+Start peer nodes first:
 
 ```bash
-python -m dllm.cli serve --role worker --model-name Qwen/Qwen2.5-0.5B-Instruct --node-name node-b --device cuda --peer-host 0.0.0.0 --peer-port 8765
-python -m dllm.cli serve --role worker --model-name Qwen/Qwen2.5-0.5B-Instruct --node-name node-c --device cuda --peer-host 0.0.0.0 --peer-port 8765
+python3 -m dllm.cli serve \
+  --role worker \
+  --model-name Qwen/Qwen2.5-0.5B-Instruct \
+  --node-name node-b \
+  --device auto \
+  --peer-host 0.0.0.0 \
+  --peer-port 8765 \
+  --no-peer-discovery
+
+python3 -m dllm.cli serve \
+  --role worker \
+  --model-name Qwen/Qwen2.5-0.5B-Instruct \
+  --node-name node-c \
+  --device auto \
+  --peer-host 0.0.0.0 \
+  --peer-port 8765 \
+  --no-peer-discovery
 ```
 
 Start the server node. Keep local loading enabled; this node runs the first shard:
 
 ```bash
-python -m dllm.cli serve \
+python3 -m dllm.cli serve \
   --role server \
   --model-name Qwen/Qwen2.5-0.5B-Instruct \
   --node-name node-a \
-  --device cuda
-```
-
-You can still assign peers explicitly; manual peers are merged with LAN-discovered peers:
-
-```bash
-python -m dllm.cli serve \
-  --role server \
-  --model-name Qwen/Qwen2.5-0.5B-Instruct \
-  --node-name node-a \
-  --device cuda \
-  --peers node-b@192.168.0.5:8765,node-c@192.168.0.6:8765
+  --device auto \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --peers node-b@192.168.0.5:8765,node-c@192.168.0.6:8765 \
+  --no-peer-discovery
 ```
 
 Shard convention follows Cheetah's Python runtime:
@@ -217,6 +227,15 @@ The server exposes:
 - `POST /v1/chat/completions`
 
 Disable LAN discovery with `--no-peer-discovery` or `DLLM_PEER_DISCOVERY=false`. Startup prints the DLLM banner, resolved LAN IPs, model, role, bind addresses, discovery settings, and peer list. Generation logs include elapsed time and tokens/sec.
+
+Before sending a generation request, verify that the server sees peer hardware. After the first request, `/health` also shows the assigned shards:
+
+```bash
+curl -s 'http://127.0.0.1:8000/health?probe=true' | python3 -m json.tool
+curl -s http://127.0.0.1:8000/generate \
+  -H 'content-type: application/json' \
+  -d '{"prompt":"Write one short sentence.","max_new_tokens":16}' | python3 -m json.tool
+```
 
 `--preload` only prepares tokenizer/runtime metadata. It does not load full model weights or assign shards at startup because shard planning depends on the first request's prefill and decode sizes.
 

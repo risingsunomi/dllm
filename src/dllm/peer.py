@@ -189,6 +189,7 @@ class InferenceWorker:
             "uptime_seconds": time.time() - self.started_at,
             "host": self.settings.peer_host,
             "port": self.settings.peer_port,
+            "device_info": engine_health.get("device_info"),
             "engine": engine_health,
         }
 

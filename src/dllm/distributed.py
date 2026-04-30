@@ -7,6 +7,7 @@ from typing import Any
 
 from .config import PeerSpec, Settings
 from .model import TorchTransformersEngine, request_from_payload
+from .model.device_info import collect_host_info, host_weight
 from .peer import PeerClient, _payload_with_prompt
 from .sharding import LayerShard, build_layer_shards, total_layers_from_config
 
@@ -19,6 +20,7 @@ class PeerState:
     last_error: str = ""
     last_seen: float = 0.0
     shard: LayerShard | None = None
+    device_info: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -28,6 +30,7 @@ class PeerState:
             "last_error": self.last_error,
             "last_seen": self.last_seen,
             "shard": self.shard.as_dict() if self.shard is not None else None,
+            "device_info": self.device_info,
         }
 
 
@@ -67,6 +70,7 @@ class DistributedInferenceEngine:
             connect_timeout=settings.peer_connect_timeout,
         )
         self.peers = [PeerState(spec=peer) for peer in settings.peers]
+        self.local_device_info = collect_host_info()
         self.local_shard: LayerShard | None = None
         self.plan_prefill_tokens = 0
         self.plan_decode_tokens = 0
@@ -78,6 +82,8 @@ class DistributedInferenceEngine:
             if self._ready:
                 return
             errors: list[str] = []
+            if self.peers:
+                self.refresh_peer_health()
             self._plan_shards(prefill_tokens=prefill_tokens, decode_tokens=decode_tokens)
             for peer in self.peers:
                 if peer.shard is None:
@@ -86,6 +92,8 @@ class DistributedInferenceEngine:
                     self._load_peer(peer)
                 except Exception as exc:
                     errors.append(f"{peer.spec.name}: {exc}")
+            if errors:
+                raise RuntimeError(f"not all shard peers are ready: {'; '.join(errors)}")
             if self.local_engine is None and not any(peer.healthy for peer in self.peers):
                 detail = "; ".join(errors) if errors else "no local or remote targets configured"
                 raise RuntimeError(f"no inference targets are ready: {detail}")
@@ -116,6 +124,7 @@ class DistributedInferenceEngine:
             "device": self.settings.device,
             "ready": self._ready,
             "runtime": "sharded" if self._using_shards() else "single-node",
+            "device_info": self.local_device_info,
             "plan_prefill_tokens": self.plan_prefill_tokens,
             "plan_decode_tokens": self.plan_decode_tokens,
             "local_shard": self.local_shard.as_dict() if self.local_shard is not None else None,
@@ -133,6 +142,10 @@ class DistributedInferenceEngine:
                 peer.last_seen = time.time()
                 payload = response.get("payload", {})
                 engine = payload.get("engine", {}) if isinstance(payload, dict) else {}
+                device_info = payload.get("device_info") if isinstance(payload, dict) else None
+                if not isinstance(device_info, dict):
+                    device_info = engine.get("device_info") if isinstance(engine, dict) else None
+                peer.device_info = device_info if isinstance(device_info, dict) else peer.device_info
                 peer.loaded = bool(engine.get("loaded", peer.loaded))
                 results.append({"peer": peer.as_dict(), "health": payload})
             except Exception as exc:
@@ -185,6 +198,7 @@ class DistributedInferenceEngine:
             model_name=self.settings.model_name,
             total_layers=total_layers,
             node_names=node_names,
+            node_weights=self._node_weights(),
             prefill_tokens=self.plan_prefill_tokens,
             decode_tokens=self.plan_decode_tokens,
         )
@@ -215,6 +229,12 @@ class DistributedInferenceEngine:
         if total_layers <= 1:
             raise RuntimeError("model config does not expose num_hidden_layers for sharding")
         return total_layers
+
+    def _node_weights(self) -> list[float]:
+        weights = [host_weight(self.local_device_info, self.settings.device)]
+        for peer in self.peers:
+            weights.append(host_weight(peer.device_info, self.settings.device))
+        return weights
 
     def _using_shards(self) -> bool:
         return self.local_shard is not None and any(peer.shard is not None for peer in self.peers)

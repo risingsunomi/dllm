@@ -6,13 +6,15 @@ import time
 import threading
 import base64
 import inspect
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Thread
 from typing import Any
 
-from .sharding import LayerShard
-from .tools import normalize_tools, tool_system_prompt
+from ..sharding import LayerShard
+from ..tools import normalize_tools, tool_system_prompt
+from .device_info import collect_host_info, resolve_torch_device
 
 
 @dataclass(frozen=True)
@@ -119,6 +121,8 @@ class TorchTransformersEngine:
         self.model_config: dict[str, Any] = {}
         self.source_config: dict[str, Any] = {}
         self.language_loading: dict[str, Any] = {}
+        self.device_info: dict[str, Any] = collect_host_info()
+        self.selected_device_info: dict[str, Any] = {}
         self.device = "unloaded"
         self.input_device = "cpu"
         self.loaded = False
@@ -133,7 +137,9 @@ class TorchTransformersEngine:
 
             torch = _import_torch()
             transformers = _import_transformers()
-            device = _resolve_device(self.requested_device, torch)
+            device_choice = resolve_torch_device(self.requested_device, torch)
+            device = device_choice.torch_device
+            self.selected_device_info = device_choice.info
             dtype = _resolve_dtype(self.dtype_name, device, torch)
             device_map = _parse_device_map(self.device_map_name)
             base_config = transformers.AutoConfig.from_pretrained(
@@ -180,12 +186,25 @@ class TorchTransformersEngine:
             if key_mapping:
                 model_kwargs["key_mapping"] = key_mapping
 
-            model = transformers.AutoModelForCausalLM.from_pretrained(
-                self.model_name,
-                **model_kwargs,
-            )
             if self.shard is not None:
-                _apply_loaded_shard(model, self.shard, torch)
+                model = _load_sharded_causal_lm(
+                    transformers,
+                    self.model_name,
+                    model_kwargs,
+                    shard=self.shard,
+                    device=device,
+                    dtype=dtype,
+                    key_mapping=key_mapping,
+                    offline=self.offline,
+                    trust_remote_code=self.trust_remote_code,
+                    torch=torch,
+                )
+                device_map = None
+            else:
+                model = transformers.AutoModelForCausalLM.from_pretrained(
+                    self.model_name,
+                    **model_kwargs,
+                )
             if device_map is None:
                 model.to(device)
             model.eval()
@@ -575,6 +594,8 @@ class TorchTransformersEngine:
             "language_weight_prefix": self.language_weight_prefix,
             "weight_key_mapping": self.weight_key_mapping,
             "language_loading": self.language_loading,
+            "device_info": self.device_info,
+            "selected_device": self.selected_device_info,
             "shard": self.shard.as_dict() if self.shard is not None else None,
             "loaded": self.loaded,
             "offline": self.offline,
@@ -964,16 +985,7 @@ def _stop_criteria(
 
 
 def _resolve_device(requested: str, torch: Any) -> str:
-    device = str(requested or "cpu").strip().lower()
-    if device == "auto":
-        if torch.cuda.is_available():
-            return "cuda"
-        if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-            return "mps"
-        return "cpu"
-    if device == "metal":
-        return "mps"
-    return device
+    return resolve_torch_device(requested, torch).torch_device
 
 
 def _resolve_dtype(dtype_name: str, device: str, torch: Any) -> Any | None:
@@ -1390,3 +1402,296 @@ def _float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _load_sharded_causal_lm(
+    transformers: Any,
+    model_name: str,
+    model_kwargs: dict[str, Any],
+    *,
+    shard: LayerShard,
+    device: str,
+    dtype: Any | None,
+    key_mapping: dict[str, str],
+    offline: bool,
+    trust_remote_code: bool,
+    torch: Any,
+) -> Any:
+    config = model_kwargs.get("config")
+    if config is None:
+        raise RuntimeError("sharded loading requires a resolved model config")
+
+    with _empty_weights_context():
+        model = transformers.AutoModelForCausalLM.from_config(
+            config,
+            trust_remote_code=trust_remote_code,
+        )
+
+    _trim_model_to_shard(model, shard, torch)
+    _materialize_empty_model(model, device=device, dtype=dtype, torch=torch)
+
+    checkpoint_dir = _resolve_checkpoint_dir(model_name, offline=offline)
+    load_info = _load_safetensor_shard_weights(
+        model,
+        checkpoint_dir,
+        key_mapping=key_mapping,
+        device=device,
+        torch=torch,
+    )
+    model.dllm_shard_load = {  # type: ignore[attr-defined]
+        **load_info,
+        "checkpoint_dir": str(checkpoint_dir),
+        "shard": shard.as_dict(),
+    }
+    return model
+
+
+def _empty_weights_context() -> Any:
+    try:
+        from accelerate import init_empty_weights
+    except Exception as exc:
+        raise RuntimeError("accelerate is required for shard-native Transformers loading") from exc
+    try:
+        return init_empty_weights(include_buffers=True)
+    except TypeError:
+        return init_empty_weights()
+
+
+def _trim_model_to_shard(model: Any, shard: LayerShard, torch: Any) -> None:
+    _apply_loaded_shard(model, shard, torch)
+    if not shard.is_first:
+        _replace_input_embeddings(model, torch.nn.Identity())
+    if not shard.is_final:
+        _replace_output_embeddings(model, torch.nn.Identity())
+
+
+def _replace_input_embeddings(model: Any, replacement: Any) -> None:
+    for target in (model, _causal_base_model(model)):
+        setter = getattr(target, "set_input_embeddings", None)
+        if callable(setter):
+            try:
+                setter(replacement)
+                return
+            except Exception:
+                pass
+    for path in (
+        "model.embed_tokens",
+        "model.decoder.embed_tokens",
+        "transformer.wte",
+        "gpt_neox.embed_in",
+        "base_model.embed_tokens",
+    ):
+        resolved = _resolve_parent_attr(model, path)
+        if resolved is not None:
+            parent, name = resolved
+            if getattr(parent, name, None) is not None:
+                setattr(parent, name, replacement)
+                return
+
+
+def _replace_output_embeddings(model: Any, replacement: Any) -> None:
+    setter = getattr(model, "set_output_embeddings", None)
+    if callable(setter):
+        try:
+            setter(replacement)
+            return
+        except Exception:
+            pass
+    for path in ("lm_head", "embed_out", "output"):
+        if getattr(model, path, None) is not None:
+            setattr(model, path, replacement)
+            return
+
+
+def _materialize_empty_model(model: Any, *, device: str, dtype: Any | None, torch: Any) -> None:
+    del torch
+    to_empty = getattr(model, "to_empty", None)
+    if callable(to_empty):
+        to_empty(device=device)
+    else:
+        raise RuntimeError("PyTorch model.to_empty is required for shard-native loading")
+    if dtype is not None:
+        model.to(dtype=dtype)
+
+
+def _resolve_checkpoint_dir(model_name: str, *, offline: bool) -> Path:
+    candidate = Path(model_name).expanduser()
+    if candidate.exists():
+        if candidate.is_dir():
+            return candidate
+        return candidate.parent
+
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception as exc:
+        raise RuntimeError("huggingface-hub is required to resolve remote model checkpoints") from exc
+
+    try:
+        resolved = snapshot_download(
+            repo_id=model_name,
+            local_files_only=offline,
+            allow_patterns=[
+                "*.safetensors",
+                "**/*.safetensors",
+                "*.safetensors.index.json",
+                "**/*.safetensors.index.json",
+                "config.json",
+                "generation_config.json",
+            ],
+        )
+    except Exception as exc:
+        mode = "cached" if offline else "downloaded or cached"
+        raise RuntimeError(f"could not resolve {mode} safetensors checkpoint for {model_name!r}") from exc
+    return Path(resolved)
+
+
+def _load_safetensor_shard_weights(
+    model: Any,
+    checkpoint_dir: Path,
+    *,
+    key_mapping: dict[str, str],
+    device: str,
+    torch: Any,
+) -> dict[str, Any]:
+    try:
+        from safetensors import safe_open
+    except Exception as exc:
+        raise RuntimeError("safetensors is required for shard-native loading") from exc
+
+    weight_map = _safetensor_weight_map(checkpoint_dir)
+    if not weight_map:
+        raise RuntimeError(
+            "shard-native loading requires safetensors weights; no *.safetensors files were found"
+        )
+
+    state = model.state_dict()
+    state_keys = set(state.keys())
+    target_to_source: dict[str, str] = {}
+    for source_key in weight_map:
+        target_key = _mapped_checkpoint_key(source_key, key_mapping)
+        if target_key in state_keys:
+            target_to_source[target_key] = source_key
+    _add_tied_output_fallbacks(target_to_source, weight_map, state_keys)
+
+    parameter_keys = set(dict(model.named_parameters()).keys())
+    missing_parameters = sorted(key for key in parameter_keys if key not in target_to_source)
+    if missing_parameters:
+        preview = ", ".join(missing_parameters[:8])
+        extra = "" if len(missing_parameters) <= 8 else f" and {len(missing_parameters) - 8} more"
+        raise RuntimeError(f"checkpoint is missing required shard parameter(s): {preview}{extra}")
+
+    by_file: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for target_key, source_key in target_to_source.items():
+        by_file[str(weight_map[source_key])].append((target_key, source_key))
+
+    loaded: set[str] = set()
+    for filename, pairs in sorted(by_file.items()):
+        file_path = checkpoint_dir / filename
+        if not file_path.exists():
+            raise RuntimeError(f"checkpoint shard file is missing: {file_path}")
+        partial: dict[str, Any] = {}
+        with safe_open(str(file_path), framework="pt", device="cpu") as handle:
+            keys = set(handle.keys())
+            for target_key, source_key in pairs:
+                if source_key not in keys:
+                    continue
+                tensor = handle.get_tensor(source_key)
+                target = state.get(target_key)
+                if target is not None:
+                    if target.dtype.is_floating_point and tensor.dtype.is_floating_point:
+                        tensor = tensor.to(dtype=target.dtype)
+                    elif not target.dtype.is_floating_point:
+                        tensor = tensor.to(dtype=target.dtype)
+                    target_device = target.device
+                    if str(target_device) == "meta":
+                        tensor = tensor.to(device)
+                    else:
+                        tensor = tensor.to(target_device)
+                else:
+                    tensor = tensor.to(device)
+                partial[target_key] = tensor
+        if partial:
+            try:
+                model.load_state_dict(partial, strict=False, assign=True)
+            except TypeError:
+                model.load_state_dict(partial, strict=False)
+            loaded.update(partial)
+
+    still_missing = sorted(key for key in parameter_keys if key not in loaded)
+    if still_missing:
+        preview = ", ".join(still_missing[:8])
+        extra = "" if len(still_missing) <= 8 else f" and {len(still_missing) - 8} more"
+        raise RuntimeError(f"failed to load required shard parameter(s): {preview}{extra}")
+
+    meta_tensors = [name for name, tensor in model.state_dict().items() if getattr(tensor, "is_meta", False)]
+    if meta_tensors:
+        preview = ", ".join(meta_tensors[:8])
+        extra = "" if len(meta_tensors) <= 8 else f" and {len(meta_tensors) - 8} more"
+        raise RuntimeError(f"shard still has meta tensor(s) after loading: {preview}{extra}")
+
+    return {
+        "loaded_parameters": len(loaded),
+        "checkpoint_parameters": len(weight_map),
+        "files": sorted(by_file),
+    }
+
+
+def _safetensor_weight_map(checkpoint_dir: Path) -> dict[str, str]:
+    index_path = _preferred_weight_index_path(checkpoint_dir)
+    if index_path is not None:
+        try:
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"could not read safetensors index {index_path}") from exc
+        weight_map = payload.get("weight_map", {})
+        if not isinstance(weight_map, dict):
+            raise RuntimeError(f"safetensors index has no weight_map: {index_path}")
+        return {str(key): str(value) for key, value in weight_map.items()}
+
+    try:
+        from safetensors import safe_open
+    except Exception as exc:
+        raise RuntimeError("safetensors is required for shard-native loading") from exc
+    result: dict[str, str] = {}
+    for file_path in sorted(checkpoint_dir.glob("*.safetensors")):
+        with safe_open(str(file_path), framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                result[str(key)] = file_path.name
+    return result
+
+
+def _mapped_checkpoint_key(source_key: str, key_mapping: dict[str, str]) -> str:
+    target = source_key
+    for pattern, replacement in key_mapping.items():
+        try:
+            updated = re.sub(pattern, replacement, target)
+        except re.error:
+            continue
+        if updated != target:
+            target = updated
+    return target
+
+
+def _add_tied_output_fallbacks(
+    target_to_source: dict[str, str],
+    weight_map: dict[str, str],
+    state_keys: set[str],
+) -> None:
+    embedding_sources = (
+        "model.embed_tokens.weight",
+        "model.decoder.embed_tokens.weight",
+        "transformer.wte.weight",
+        "gpt_neox.embed_in.weight",
+        "base_model.embed_tokens.weight",
+    )
+    output_targets = (
+        "lm_head.weight",
+        "embed_out.weight",
+        "output.weight",
+    )
+    source = next((key for key in embedding_sources if key in weight_map), "")
+    if not source:
+        return
+    for target in output_targets:
+        if target in state_keys and target not in target_to_source:
+            target_to_source[target] = source

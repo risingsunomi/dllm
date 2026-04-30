@@ -52,6 +52,18 @@ class ShardingTests(unittest.TestCase):
             (13, 16),
         ])
 
+    def test_node_weights_bias_shard_sizes(self) -> None:
+        shards = build_layer_shards(
+            model_name="demo",
+            total_layers=13,
+            node_names=["small", "large"],
+            node_weights=[1.0, 3.0],
+        )
+        self.assertEqual([(shard.start_layer, shard.end_layer) for shard in shards], [
+            (0, 3),
+            (3, 12),
+        ])
+
     def test_layer_shard_from_mapping(self) -> None:
         shard = LayerShard.from_mapping(
             {"model_name": "demo", "start_layer": 1, "end_layer": 2, "total_layers": 3}
