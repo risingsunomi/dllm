@@ -808,11 +808,45 @@ def _call_with_supported_kwargs(module: Any, kwargs: dict[str, Any]) -> Any:
 
 def _last_hidden_state(outputs: Any) -> Any:
     hidden = getattr(outputs, "last_hidden_state", None)
+    hidden = _first_tensor(hidden)
     if hidden is not None:
         return hidden
-    if isinstance(outputs, (tuple, list)) and outputs:
-        return outputs[0]
+    hidden = _first_tensor(outputs)
+    if hidden is not None:
+        return hidden
     raise RuntimeError("shard forward did not return hidden states")
+
+
+def _first_tensor(value: Any) -> Any | None:
+    if value is None:
+        return None
+    if _is_tensor_like(value):
+        return value
+    nested = getattr(value, "last_hidden_state", None)
+    if nested is not None and nested is not value:
+        found = _first_tensor(nested)
+        if found is not None:
+            return found
+    if isinstance(value, dict):
+        for key in ("last_hidden_state", "hidden_states", "logits"):
+            if key in value:
+                found = _first_tensor(value[key])
+                if found is not None:
+                    return found
+        for item in value.values():
+            found = _first_tensor(item)
+            if found is not None:
+                return found
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            found = _first_tensor(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _is_tensor_like(value: Any) -> bool:
+    return all(hasattr(value, attr) for attr in ("detach", "shape", "dtype"))
 
 
 def _output_embeddings(model: Any) -> Any | None:

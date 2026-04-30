@@ -5,6 +5,7 @@ import unittest
 from dllm.model import (
     _auto_weight_key_mapping,
     _key_mapping_for_prefixes,
+    _last_hidden_state,
     _moe_metadata,
     _nested_language_config_dict,
     _parse_device_map,
@@ -15,6 +16,17 @@ from dllm.model import (
 
 
 class ModelLoadingOptionsTests(unittest.TestCase):
+    def test_last_hidden_state_unwraps_nested_tuples(self) -> None:
+        class FakeTensor:
+            shape = (1, 2, 3)
+            dtype = "float32"
+
+            def detach(self):  # pragma: no cover - identity marker for tensor-like duck typing
+                return self
+
+        tensor = FakeTensor()
+        self.assertIs(_last_hidden_state(((tensor,),)), tensor)
+
     def test_parse_device_map(self) -> None:
         self.assertIsNone(_parse_device_map(""))
         self.assertIsNone(_parse_device_map("none"))
