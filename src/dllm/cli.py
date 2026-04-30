@@ -128,8 +128,8 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--preload",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="load local and remote models before accepting requests",
+        default=False,
+        help="preload tokenizer/runtime metadata; shard weights still load on first inference",
     )
     return parser
 
@@ -146,10 +146,11 @@ def _serve(settings: Settings, *, preload: bool) -> int:
         print(startup_banner(settings, peers=settings.peers, title="peer"), flush=True)
         if preload:
             print(
-                f"loading worker model={settings.model_name} node={settings.node_name} device={settings.device}",
+                f"preloading worker tokenizer model={settings.model_name} "
+                f"node={settings.node_name} device={settings.device}",
                 flush=True,
             )
-            worker.engine.load()
+            worker.engine.load_tokenizer()
         if settings.role == "worker":
             try:
                 worker.serve_forever()
@@ -178,11 +179,12 @@ def _serve(settings: Settings, *, preload: bool) -> int:
     print(startup_banner(settings, peers=settings.peers, title="server"), flush=True)
     if preload:
         print(
-            f"preparing server model={settings.model_name} node={settings.node_name} "
-            f"http={settings.host}:{settings.port}",
+            f"preloading server tokenizer; shard plan waits for first request model={settings.model_name} "
+            f"node={settings.node_name} http={settings.host}:{settings.port}",
             flush=True,
         )
-        engine.ensure_ready()
+        if engine.local_engine is not None:
+            engine.local_engine.load_tokenizer()
 
     print(
         f"http listening node={settings.node_name} role={settings.role} "

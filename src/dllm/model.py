@@ -159,13 +159,7 @@ class TorchTransformersEngine:
                 )
             )
 
-            tokenizer = transformers.AutoTokenizer.from_pretrained(
-                self.model_name,
-                local_files_only=self.offline,
-                trust_remote_code=self.trust_remote_code,
-            )
-            if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
-                tokenizer.pad_token = tokenizer.eos_token
+            tokenizer = self._load_tokenizer(transformers)
 
             model_kwargs: dict[str, Any] = {
                 "local_files_only": self.offline,
@@ -205,6 +199,26 @@ class TorchTransformersEngine:
             self.device = _runtime_device_label(model, fallback=device, device_map=device_map)
             self.loaded = True
 
+    def load_tokenizer(self) -> None:
+        with self._lock:
+            transformers = _import_transformers()
+            self._load_tokenizer(transformers)
+
+    def _load_tokenizer(self, transformers: Any) -> Any:
+        if self.tokenizer is not None:
+            return self.tokenizer
+        if not self.model_name:
+            raise ValueError("model_name is required before loading the tokenizer")
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            self.model_name,
+            local_files_only=self.offline,
+            trust_remote_code=self.trust_remote_code,
+        )
+        if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        self.tokenizer = tokenizer
+        return tokenizer
+
     def unload(self) -> None:
         with self._lock:
             self.model = None
@@ -226,7 +240,8 @@ class TorchTransformersEngine:
             requested = shard.as_dict() if shard is not None else None
             if current == requested:
                 return
-            self.unload()
+            if self.loaded:
+                self.unload()
             self.shard = shard
 
     def format_chat_prompt(
@@ -236,7 +251,7 @@ class TorchTransformersEngine:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
     ) -> str:
-        self.load()
+        self.load_tokenizer()
         assert self.tokenizer is not None
         normalized_tools = normalize_tools(tools)
         if getattr(self.tokenizer, "chat_template", None):
@@ -425,7 +440,7 @@ class TorchTransformersEngine:
             ).as_dict()
 
     def encode_inputs(self, prompt: str) -> dict[str, Any]:
-        self.load()
+        self.load_tokenizer()
         assert self.tokenizer is not None
         torch = _import_torch()
 
@@ -447,7 +462,6 @@ class TorchTransformersEngine:
             }
 
     def append_token_to_inputs(self, encoded_inputs: dict[str, Any], token_id: int) -> dict[str, Any]:
-        self.load()
         torch = _import_torch()
         with self._lock:
             input_ids = _decode_tensor(encoded_inputs.get("input_ids"), torch, self.input_device)
@@ -468,9 +482,16 @@ class TorchTransformersEngine:
             }
 
     def decode_token_ids(self, token_ids: list[int]) -> str:
-        self.load()
+        self.load_tokenizer()
         assert self.tokenizer is not None
         return self.tokenizer.decode([int(token_id) for token_id in token_ids], skip_special_tokens=True)
+
+    def count_prompt_tokens(self, prompt: str) -> int:
+        self.load_tokenizer()
+        assert self.tokenizer is not None
+        with self._lock:
+            encoded = self.tokenizer(str(prompt), return_tensors="pt")
+            return int(encoded["input_ids"].shape[-1])
 
     def forward_shard(self, payload: dict[str, Any]) -> dict[str, Any]:
         self.load()

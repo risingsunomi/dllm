@@ -37,6 +37,21 @@ class ShardingTests(unittest.TestCase):
             },
         ])
 
+    def test_prefill_and_decode_cost_adjust_final_shard(self) -> None:
+        shards = build_layer_shards(
+            model_name="demo",
+            total_layers=17,
+            node_names=["server", "node-b", "node-c", "node-d"],
+            prefill_tokens=1,
+            decode_tokens=128,
+        )
+        self.assertEqual([(shard.start_layer, shard.end_layer) for shard in shards], [
+            (0, 5),
+            (5, 9),
+            (9, 13),
+            (13, 16),
+        ])
+
     def test_layer_shard_from_mapping(self) -> None:
         shard = LayerShard.from_mapping(
             {"model_name": "demo", "start_layer": 1, "end_layer": 2, "total_layers": 3}

@@ -68,17 +68,17 @@ class DistributedInferenceEngine:
         )
         self.peers = [PeerState(spec=peer) for peer in settings.peers]
         self.local_shard: LayerShard | None = None
+        self.plan_prefill_tokens = 0
+        self.plan_decode_tokens = 0
         self._lock = threading.RLock()
         self._ready = False
 
-    def ensure_ready(self) -> None:
+    def ensure_ready(self, *, prefill_tokens: int = 0, decode_tokens: int = 0) -> None:
         with self._lock:
             if self._ready:
                 return
             errors: list[str] = []
-            self._plan_shards()
-            if self.local_engine is not None:
-                self.local_engine.load()
+            self._plan_shards(prefill_tokens=prefill_tokens, decode_tokens=decode_tokens)
             for peer in self.peers:
                 if peer.shard is None:
                     continue
@@ -86,23 +86,25 @@ class DistributedInferenceEngine:
                     self._load_peer(peer)
                 except Exception as exc:
                     errors.append(f"{peer.spec.name}: {exc}")
-            if self.local_engine is None and not any(peer.loaded for peer in self.peers):
+            if self.local_engine is None and not any(peer.healthy for peer in self.peers):
                 detail = "; ".join(errors) if errors else "no local or remote targets configured"
                 raise RuntimeError(f"no inference targets are ready: {detail}")
             self._ready = True
 
     def generate(self, payload: dict[str, Any]) -> dict[str, Any]:
-        self.ensure_ready()
+        request_payload, request, prefill_tokens = self._prepare_request(payload)
+        self.ensure_ready(prefill_tokens=prefill_tokens, decode_tokens=request.max_new_tokens)
         if self._using_shards():
-            return self._generate_sharded(payload)
-        return self._generate_local(payload)
+            return self._generate_sharded(request_payload, request, prefill_tokens)
+        return self._generate_local(request_payload, request)
 
     def stream(self, payload: dict[str, Any]):
-        self.ensure_ready()
+        request_payload, request, prefill_tokens = self._prepare_request(payload)
+        self.ensure_ready(prefill_tokens=prefill_tokens, decode_tokens=request.max_new_tokens)
         if self._using_shards():
-            yield from self._stream_sharded(payload)
+            yield from self._stream_sharded(request_payload, request, prefill_tokens)
             return
-        yield from self._stream_local(payload)
+        yield from self._stream_local(request_payload, request)
 
     def health(self, *, probe_peers: bool = False) -> dict[str, Any]:
         if probe_peers:
@@ -114,6 +116,8 @@ class DistributedInferenceEngine:
             "device": self.settings.device,
             "ready": self._ready,
             "runtime": "sharded" if self._using_shards() else "single-node",
+            "plan_prefill_tokens": self.plan_prefill_tokens,
+            "plan_decode_tokens": self.plan_decode_tokens,
             "local_shard": self.local_shard.as_dict() if self.local_shard is not None else None,
             "local": self.local_engine.health() if self.local_engine is not None else None,
             "peers": [peer.as_dict() for peer in self.peers],
@@ -151,7 +155,9 @@ class DistributedInferenceEngine:
                 shard=peer.shard,
             )
             peer.healthy = True
-            peer.loaded = True
+            payload = response.get("payload", {})
+            engine = payload.get("engine", {}) if isinstance(payload, dict) else {}
+            peer.loaded = bool(engine.get("loaded", False))
             peer.last_error = ""
             peer.last_seen = time.time()
             if response.get("ok") is False:
@@ -162,7 +168,9 @@ class DistributedInferenceEngine:
             peer.last_error = str(exc)
             raise
 
-    def _plan_shards(self) -> None:
+    def _plan_shards(self, *, prefill_tokens: int, decode_tokens: int) -> None:
+        self.plan_prefill_tokens = max(int(prefill_tokens), 0)
+        self.plan_decode_tokens = max(int(decode_tokens), 0)
         if not self.peers or self.local_engine is None:
             self.local_shard = None
             if self.local_engine is not None:
@@ -177,6 +185,8 @@ class DistributedInferenceEngine:
             model_name=self.settings.model_name,
             total_layers=total_layers,
             node_names=node_names,
+            prefill_tokens=self.plan_prefill_tokens,
+            decode_tokens=self.plan_decode_tokens,
         )
         if len(plan) <= 1:
             self.local_shard = None
@@ -210,28 +220,53 @@ class DistributedInferenceEngine:
         return self.local_shard is not None and any(peer.shard is not None for peer in self.peers)
 
     def _shard_peers(self) -> list[PeerState]:
-        return [peer for peer in self.peers if peer.shard is not None and peer.loaded]
+        return [peer for peer in self.peers if peer.shard is not None and (peer.healthy or not peer.last_error)]
 
-    def _generate_sharded(self, payload: dict[str, Any]) -> dict[str, Any]:
-        events = list(self._run_sharded(payload, emit_tokens=False))
-        done = events[-1] if events else {}
-        return dict(done)
-
-    def _stream_sharded(self, payload: dict[str, Any]):
-        yield from self._run_sharded(payload, emit_tokens=True)
-
-    def _run_sharded(self, payload: dict[str, Any], *, emit_tokens: bool):
+    def _prepare_request(self, payload: dict[str, Any]) -> tuple[dict[str, Any], Any, int]:
         if self.local_engine is None:
-            raise RuntimeError("sharded inference requires a local server shard")
-
+            raise RuntimeError("the server node must load the first shard")
         request_payload = _payload_with_prompt(
             self.local_engine,
             payload,
             self.settings.generation_defaults(),
         )
         request = request_from_payload(request_payload, self.settings.generation_defaults())
+        prefill_tokens = self.local_engine.count_prompt_tokens(request.prompt)
+        return request_payload, request, prefill_tokens
+
+    def _generate_sharded(self, request_payload: dict[str, Any], request: Any, prefill_tokens: int) -> dict[str, Any]:
+        events = list(
+            self._run_sharded(
+                request_payload,
+                request,
+                prefill_tokens=prefill_tokens,
+                emit_tokens=False,
+            )
+        )
+        done = events[-1] if events else {}
+        return dict(done)
+
+    def _stream_sharded(self, request_payload: dict[str, Any], request: Any, prefill_tokens: int):
+        yield from self._run_sharded(
+            request_payload,
+            request,
+            prefill_tokens=prefill_tokens,
+            emit_tokens=True,
+        )
+
+    def _run_sharded(
+        self,
+        request_payload: dict[str, Any],
+        request: Any,
+        *,
+        prefill_tokens: int,
+        emit_tokens: bool,
+    ):
+        if self.local_engine is None:
+            raise RuntimeError("sharded inference requires a local server shard")
+
         encoded_inputs = self.local_engine.encode_inputs(request.prompt)
-        prompt_tokens = int(encoded_inputs.get("prompt_tokens", 0))
+        prompt_tokens = int(encoded_inputs.get("prompt_tokens", prefill_tokens))
         seen_tokens = list(encoded_inputs.get("seen_tokens", []))
         token_ids: list[int] = []
         text_parts: list[str] = []
@@ -313,15 +348,9 @@ class DistributedInferenceEngine:
                 summary.append({"node_name": peer.spec.name, "shard": peer.shard.as_dict()})
         return summary
 
-    def _generate_local(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _generate_local(self, request_payload: dict[str, Any], request: Any) -> dict[str, Any]:
         if self.local_engine is None:
             raise RuntimeError("local inference is disabled")
-        request_payload = _payload_with_prompt(
-            self.local_engine,
-            payload,
-            self.settings.generation_defaults(),
-        )
-        request = request_from_payload(request_payload, self.settings.generation_defaults())
         result = self.local_engine.generate(request).as_dict()
         result["node_name"] = self.settings.node_name
         result["target"] = "local"
@@ -329,15 +358,10 @@ class DistributedInferenceEngine:
         _log_tokens_per_second(result)
         return result
 
-    def _stream_local(self, payload: dict[str, Any]):
+    def _stream_local(self, request_payload: dict[str, Any], request: Any):
+        del request_payload
         if self.local_engine is None:
             raise RuntimeError("local inference is disabled")
-        request_payload = _payload_with_prompt(
-            self.local_engine,
-            payload,
-            self.settings.generation_defaults(),
-        )
-        request = request_from_payload(request_payload, self.settings.generation_defaults())
         for event in self.local_engine.generate_stream(request):
             event_out = dict(event)
             if event_out.get("event") == "done":

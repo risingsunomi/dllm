@@ -7,6 +7,7 @@ dllm v1.0 is a shard-first distributed PyTorch inference server for local and LA
 ## Highlights
 
 - Shard-first distributed inference with Cheetah-style layer ranges: `start_layer` inclusive, `end_layer` exclusive, `total_layers = num_hidden_layers + 1`.
+- Lazy shard loading: startup stays weight-cold, first inference builds a prefill/decode-aware shard plan, and each node keeps only its assigned shard after first execution.
 - LAN peer discovery over UDP probes, with manual `--peers node@host:port` still supported and merged with discovered peers.
 - OpenAI-compatible `/v1/chat/completions`, `/v1/completions`, and `/v1/models` endpoints.
 - Token-by-token SSE streaming and native OpenAI-style tool calling.
@@ -20,7 +21,7 @@ dllm v1.0 is a shard-first distributed PyTorch inference server for local and LA
 ## Breaking Changes
 
 - Multi-node serving is always sharded. The earlier replica/load-balancing mode and `--distribution-mode` option were removed.
-- Server nodes must keep local loading enabled because the server runs the first shard.
+- Server nodes must keep local loading enabled because the server owns the first shard, but weights are still loaded lazily at inference time.
 
 ## Quick Start
 

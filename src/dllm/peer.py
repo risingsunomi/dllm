@@ -169,6 +169,9 @@ class InferenceWorker:
         if command == "health":
             return {"ok": True, "payload": self.health()}
         if command == "load_model":
+            # The wire command name is kept for compatibility. In shard-first
+            # mode it configures the runtime and assigned layer range only; the
+            # actual weights load lazily when forward_shard is called.
             return self._handle_load_model(payload)
         if command == "forward_shard":
             return self._handle_forward_shard(payload)
@@ -243,12 +246,14 @@ class InferenceWorker:
                 )
 
             start = time.perf_counter()
-            self.engine.load()
+            if same_runtime and requested_shard is not None:
+                self.engine.set_shard(requested_shard)
             elapsed = time.perf_counter() - start
             return {
                 "ok": True,
                 "payload": {
-                    "loaded": True,
+                    "configured": True,
+                    "loaded": self.engine.loaded,
                     "elapsed_seconds": elapsed,
                     "engine": self.engine.health(),
                     "node_name": self.settings.node_name,

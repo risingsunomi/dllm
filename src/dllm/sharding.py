@@ -63,6 +63,8 @@ def build_layer_shards(
     model_name: str,
     total_layers: int,
     node_names: Iterable[str],
+    prefill_tokens: int = 0,
+    decode_tokens: int = 0,
 ) -> list[LayerShard]:
     names = [str(name or "").strip() or f"node-{index + 1}" for index, name in enumerate(node_names)]
     transformer_layers = max(int(total_layers or 0) - 1, 0)
@@ -70,11 +72,16 @@ def build_layer_shards(
         return []
 
     names = names[: min(len(names), transformer_layers)]
-    base_span, remainder = divmod(transformer_layers, len(names))
+    spans = _prefill_weighted_spans(
+        transformer_layers=transformer_layers,
+        parts=len(names),
+        prefill_tokens=prefill_tokens,
+        decode_tokens=decode_tokens,
+    )
     shards: list[LayerShard] = []
     start = 0
     for index, name in enumerate(names):
-        span = base_span + (1 if index < remainder else 0)
+        span = spans[index]
         end = min(start + span, transformer_layers)
         shards.append(
             LayerShard(
@@ -87,6 +94,32 @@ def build_layer_shards(
         )
         start = end
     return shards
+
+
+def _prefill_weighted_spans(
+    *,
+    transformer_layers: int,
+    parts: int,
+    prefill_tokens: int,
+    decode_tokens: int,
+) -> list[int]:
+    if parts <= 0:
+        return []
+    if parts == 1:
+        return [max(int(transformer_layers), 0)]
+
+    layers = max(int(transformer_layers), 0)
+    layer_work = max(int(prefill_tokens), 1) + max(int(decode_tokens), 1)
+    final_stage_work = max(int(decode_tokens), 1)
+    total_work = layers * layer_work + final_stage_work
+    target = total_work / parts
+    final_target = max(target - final_stage_work, layer_work)
+    final_span = max(1, min(layers - (parts - 1), round(final_target / layer_work)))
+    remaining = layers - final_span
+    base_span, remainder = divmod(remaining, parts - 1)
+    spans = [base_span + (1 if index < remainder else 0) for index in range(parts - 1)]
+    spans.append(final_span)
+    return [int(span) for span in spans]
 
 
 def total_layers_from_config(config: Any) -> int:

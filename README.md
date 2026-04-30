@@ -169,6 +169,8 @@ Local servers can skip the API key. If you want Hermes to auto-detect context le
 
 Multi-node execution is layer sharded. The server node is the first shard and owns the HTTP API; peer nodes load later contiguous transformer layer ranges. During generation, hidden states flow from the server shard through each peer shard, and the final shard applies norm/lm_head and samples the next token.
 
+Startup does not load model weights on either server or worker nodes. On the first inference request, the server formats the prompt, counts prefill tokens, builds a prefill/decode-aware shard plan, and sends each worker only its shard assignment. Each node then loads and keeps only its assigned shard when that shard is first executed.
+
 Start peer nodes. Peers respond to LAN discovery by default:
 
 ```bash
@@ -203,6 +205,7 @@ Shard convention follows Cheetah's Python runtime:
 - `end_layer` is exclusive over transformer blocks.
 - `total_layers = num_hidden_layers + 1`.
 - The extra virtual layer is the final norm/lm_head stage on the last shard.
+- Prefill token count and requested decode length are used in the first-request shard plan.
 
 The server exposes:
 
@@ -214,6 +217,8 @@ The server exposes:
 - `POST /v1/chat/completions`
 
 Disable LAN discovery with `--no-peer-discovery` or `DLLM_PEER_DISCOVERY=false`. Startup prints the DLLM banner, resolved LAN IPs, model, role, bind addresses, discovery settings, and peer list. Generation logs include elapsed time and tokens/sec.
+
+`--preload` only prepares tokenizer/runtime metadata. It does not load full model weights or assign shards at startup because shard planning depends on the first request's prefill and decode sizes.
 
 ## License
 
