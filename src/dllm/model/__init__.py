@@ -1540,7 +1540,7 @@ def _empty_weights_context() -> Any:
     except Exception as exc:
         raise RuntimeError("accelerate is required for shard-native Transformers loading") from exc
     try:
-        return init_empty_weights(include_buffers=True)
+        return init_empty_weights(include_buffers=False)
     except TypeError:
         return init_empty_weights()
 
@@ -1602,14 +1602,52 @@ def _replace_output_embeddings(model: Any, replacement: Any) -> None:
 
 
 def _materialize_empty_model(model: Any, *, device: str, dtype: Any | None, torch: Any) -> None:
-    del torch
-    to_empty = getattr(model, "to_empty", None)
-    if callable(to_empty):
-        to_empty(device=device)
-    else:
-        raise RuntimeError("PyTorch model.to_empty is required for shard-native loading")
-    if dtype is not None:
-        model.to(dtype=dtype)
+    for module in model.modules():
+        parameters = getattr(module, "_parameters", {})
+        for name, parameter in list(parameters.items()):
+            if parameter is None:
+                continue
+            target_dtype = _target_tensor_dtype(parameter, dtype)
+            if getattr(parameter, "is_meta", False):
+                materialized = torch.empty(
+                    tuple(parameter.shape),
+                    device=device,
+                    dtype=target_dtype,
+                )
+            else:
+                materialized = _move_tensor(parameter, device=device, dtype=target_dtype)
+            module._parameters[name] = torch.nn.Parameter(  # noqa: SLF001
+                materialized,
+                requires_grad=bool(getattr(parameter, "requires_grad", False)),
+            )
+
+        buffers = getattr(module, "_buffers", {})
+        for name, buffer in list(buffers.items()):
+            if buffer is None:
+                continue
+            target_dtype = _target_tensor_dtype(buffer, dtype)
+            if getattr(buffer, "is_meta", False):
+                materialized_buffer = torch.empty(
+                    tuple(buffer.shape),
+                    device=device,
+                    dtype=target_dtype,
+                )
+            else:
+                materialized_buffer = _move_tensor(buffer, device=device, dtype=target_dtype)
+            module._buffers[name] = materialized_buffer  # noqa: SLF001
+
+
+def _move_tensor(tensor: Any, *, device: str, dtype: Any | None) -> Any:
+    if dtype is None:
+        return tensor.to(device=device)
+    return tensor.to(device=device, dtype=dtype)
+
+
+def _target_tensor_dtype(tensor: Any, requested_dtype: Any | None) -> Any:
+    current = getattr(tensor, "dtype", None)
+    if requested_dtype is not None and bool(getattr(current, "is_floating_point", False)):
+        return requested_dtype
+    return current
 
 
 def _resolve_checkpoint_dir(model_name: str, *, offline: bool) -> Path:
