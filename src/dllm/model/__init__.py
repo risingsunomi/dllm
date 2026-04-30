@@ -594,6 +594,7 @@ class TorchTransformersEngine:
             "language_weight_prefix": self.language_weight_prefix,
             "weight_key_mapping": self.weight_key_mapping,
             "language_loading": self.language_loading,
+            "shard_loading": getattr(self.model, "dllm_shard_load", {}) if self.model is not None else {},
             "device_info": self.device_info,
             "selected_device": self.selected_device_info,
             "shard": self.shard.as_dict() if self.shard is not None else None,
@@ -705,7 +706,7 @@ def _apply_loaded_shard(model: Any, shard: LayerShard, torch: Any) -> None:
     layer_info = _decoder_layers(model)
     if layer_info is None:
         raise RuntimeError("could not locate decoder layers for sharded loading")
-    _, layers = layer_info
+    _, _, layers = layer_info
     start = max(int(shard.start_layer), 0)
     end = min(int(shard.end_layer), len(layers))
     if start > end:
@@ -745,7 +746,7 @@ def _causal_base_model(model: Any) -> Any:
     return model
 
 
-def _decoder_layers(model: Any) -> tuple[Any, Any] | None:
+def _decoder_layers(model: Any) -> tuple[Any, str, Any] | None:
     for path in (
         "model.layers",
         "model.decoder.layers",
@@ -760,7 +761,7 @@ def _decoder_layers(model: Any) -> tuple[Any, Any] | None:
         parent, name = resolved
         layers = getattr(parent, name, None)
         if layers is not None and hasattr(layers, "__len__") and hasattr(layers, "__setitem__"):
-            return parent, layers
+            return parent, name, layers
     return None
 
 
@@ -1472,6 +1473,7 @@ def _load_sharded_causal_lm(
         device=device,
         torch=torch,
     )
+    _drop_non_shard_layers(model, shard, torch)
     model.dllm_shard_load = {  # type: ignore[attr-defined]
         **load_info,
         "checkpoint_dir": str(checkpoint_dir),
@@ -1497,6 +1499,16 @@ def _trim_model_to_shard(model: Any, shard: LayerShard, torch: Any) -> None:
         _replace_input_embeddings(model, torch.nn.Identity())
     if not shard.is_final:
         _replace_output_embeddings(model, torch.nn.Identity())
+
+
+def _drop_non_shard_layers(model: Any, shard: LayerShard, torch: Any) -> None:
+    layer_info = _decoder_layers(model)
+    if layer_info is None:
+        raise RuntimeError("could not locate decoder layers for sharded finalization")
+    parent, name, layers = layer_info
+    start = max(int(shard.start_layer), 0)
+    end = min(int(shard.end_layer), len(layers))
+    setattr(parent, name, torch.nn.ModuleList([layers[index] for index in range(start, end)]))
 
 
 def _replace_input_embeddings(model: Any, replacement: Any) -> None:
