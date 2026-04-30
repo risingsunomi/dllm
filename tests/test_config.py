@@ -42,7 +42,9 @@ class ConfigTests(unittest.TestCase):
                 "max_memory": "0=20GiB,cpu=80GiB",
                 "offload_folder": ".offload",
                 "attention_implementation": "sdpa",
-                "distribution_mode": "replica",
+                "peer_discovery": False,
+                "discovery_port": 9999,
+                "discovery_timeout": 0.25,
                 "language_only": True,
                 "language_weight_prefix": "model.language_model.",
                 "weight_key_mapping": r"^layers\.=model.layers.",
@@ -52,18 +54,19 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.max_memory, "0=20GiB,cpu=80GiB")
         self.assertEqual(settings.offload_folder, ".offload")
         self.assertEqual(settings.attention_implementation, "sdpa")
-        self.assertEqual(settings.distribution_mode, "replica")
+        self.assertFalse(settings.peer_discovery)
+        self.assertEqual(settings.discovery_port, 9999)
+        self.assertEqual(settings.discovery_timeout, 0.25)
         self.assertTrue(settings.language_only)
         self.assertEqual(settings.language_weight_prefix, "model.language_model.")
         self.assertEqual(settings.weight_key_mapping, r"^layers\.=model.layers.")
 
-    def test_shard_distribution_requires_local_server_shard(self) -> None:
+    def test_server_requires_local_first_shard(self) -> None:
         settings = Settings.from_mapping(
             {
                 "model_name": "demo",
                 "role": "server",
                 "load_local": False,
-                "distribution_mode": "shard",
                 "peers": "node-b@127.0.0.1:8765",
             }
         )

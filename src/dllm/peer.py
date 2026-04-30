@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import Settings
-from .model import TorchTransformersEngine, request_from_payload
+from .model import TorchTransformersEngine
 from .sharding import LayerShard
 
 
@@ -90,35 +90,8 @@ class PeerClient:
             timeout=self.timeout,
         )
 
-    def generate(self, host: str, port: int, payload: dict[str, Any]) -> dict[str, Any]:
-        return self.send(host, port, {"command": "generate", "payload": payload}, timeout=self.timeout)
-
     def forward_shard(self, host: str, port: int, payload: dict[str, Any]) -> dict[str, Any]:
         return self.send(host, port, {"command": "forward_shard", "payload": payload}, timeout=self.timeout)
-
-    def generate_stream(self, host: str, port: int, payload: dict[str, Any]):
-        message = {"command": "generate_stream", "payload": payload}
-        body = json.dumps(message, separators=(",", ":")).encode("utf-8")
-        if len(body) > _MAX_MESSAGE_BYTES:
-            raise PeerProtocolError("request is too large")
-
-        with socket.create_connection((host, int(port)), timeout=self.connect_timeout) as sock:
-            sock.settimeout(self.timeout)
-            sock.sendall(_HEADER.pack(len(body)))
-            sock.sendall(body)
-            while True:
-                decoded = json.loads(_read_message(sock).decode("utf-8"))
-                if not isinstance(decoded, dict):
-                    raise PeerProtocolError("peer returned a non-object stream event")
-                if decoded.get("ok") is False:
-                    error = decoded.get("error") or decoded.get("payload", {}).get("error") or "peer stream failed"
-                    raise RuntimeError(str(error))
-                payload_out = decoded.get("payload", {})
-                if not isinstance(payload_out, dict):
-                    payload_out = {}
-                yield payload_out
-                if payload_out.get("event") in {"done", "error"}:
-                    break
 
     def send(self, host: str, port: int, message: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
         body = json.dumps(message, separators=(",", ":")).encode("utf-8")
@@ -197,12 +170,8 @@ class InferenceWorker:
             return {"ok": True, "payload": self.health()}
         if command == "load_model":
             return self._handle_load_model(payload)
-        if command == "generate":
-            return self._handle_generate(payload)
         if command == "forward_shard":
             return self._handle_forward_shard(payload)
-        if command == "generate_stream":
-            return {"ok": False, "error": "generate_stream must be handled as a stream"}
         if command == "shutdown":
             threading.Thread(target=self.stop, daemon=True).start()
             return {"ok": True, "payload": {"stopping": True}}
@@ -286,19 +255,6 @@ class InferenceWorker:
                 },
             }
 
-    def _handle_generate(self, payload: dict[str, Any]) -> dict[str, Any]:
-        with self._engine_lock:
-            request_payload = _payload_with_prompt(self.engine, payload, self.settings.generation_defaults())
-            request = request_from_payload(request_payload, self.settings.generation_defaults())
-            result = self.engine.generate(request)
-        return {
-            "ok": True,
-            "payload": {
-                **result.as_dict(),
-                "node_name": self.settings.node_name,
-            },
-        }
-
     def _handle_forward_shard(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._engine_lock:
             result = self.engine.forward_shard(payload)
@@ -310,16 +266,6 @@ class InferenceWorker:
             },
         }
 
-    def stream_generate(self, payload: dict[str, Any]):
-        with self._engine_lock:
-            request_payload = _payload_with_prompt(self.engine, payload, self.settings.generation_defaults())
-            request = request_from_payload(request_payload, self.settings.generation_defaults())
-            for event in self.engine.generate_stream(request):
-                event_payload = dict(event)
-                if event_payload.get("event") == "done":
-                    event_payload["node_name"] = self.settings.node_name
-                yield {"ok": True, "payload": event_payload}
-
     def _build_server(self) -> "_ThreadingTCPServer":
         worker = self
 
@@ -330,16 +276,6 @@ class InferenceWorker:
                     message = json.loads(raw.decode("utf-8"))
                     if not isinstance(message, dict):
                         raise PeerProtocolError("request must be a JSON object")
-                    if message.get("command") == "generate_stream":
-                        payload = message.get("payload", {})
-                        if not isinstance(payload, dict):
-                            payload = {}
-                        for response in worker.stream_generate(payload):
-                            _write_message(
-                                self.request,
-                                json.dumps(response, separators=(",", ":")).encode("utf-8"),
-                            )
-                        return
                     response = worker.dispatch(message)
                 except Exception as exc:
                     response = {"ok": False, "error": str(exc)}

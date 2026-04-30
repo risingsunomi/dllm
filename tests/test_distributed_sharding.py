@@ -58,7 +58,6 @@ class DistributedShardingTests(unittest.TestCase):
             model_name="demo",
             node_name="server",
             peers=tuple(parse_peers("node-b@127.0.0.1:8765")),
-            distribution_mode="shard",
         )
         engine = DistributedInferenceEngine(settings, local_engine=_FakeLocalEngine())  # type: ignore[arg-type]
         peer_client = _FakePeerClient()

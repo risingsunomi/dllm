@@ -3,9 +3,12 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from dataclasses import replace
 from typing import Any
 
+from .banner import startup_banner
 from .config import Settings, load_env_file
+from .discovery import DiscoveryService, discover_peers, merge_peers
 from .distributed import DistributedInferenceEngine
 from .peer import InferenceWorker
 from .server import run_http_server
@@ -32,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Standalone distributed PyTorch inference server")
+    parser = argparse.ArgumentParser(description="Standalone shard-first distributed PyTorch inference server")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     serve = subparsers.add_parser("serve", help="start an HTTP server, worker, or both")
@@ -87,14 +90,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--load-local",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="include this process as a local generation target",
+        help="server nodes must keep this enabled because they run the first shard",
     )
     serve.add_argument(
-        "--distribution-mode",
-        choices=("shard", "replica"),
+        "--peer-discovery",
+        action=argparse.BooleanOptionalAction,
         default=None,
-        help="shard one request across server+peers, or replica-load-balance full requests",
+        help="discover dllm workers on the local network",
     )
+    serve.add_argument("--discovery-port", type=int, default=None, help="UDP LAN discovery port")
+    serve.add_argument("--discovery-timeout", type=float, default=None, help="seconds to wait for LAN peers")
     serve.add_argument(
         "--offline",
         action=argparse.BooleanOptionalAction,
@@ -131,9 +136,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _serve(settings: Settings, *, preload: bool) -> int:
     worker: InferenceWorker | None = None
+    discovery_service: DiscoveryService | None = None
 
     if settings.role in {"worker", "both"}:
         worker = InferenceWorker(settings)
+        if settings.peer_discovery:
+            discovery_service = DiscoveryService(settings)
+            discovery_service.start()
+        print(startup_banner(settings, peers=settings.peers, title="peer"), flush=True)
         if preload:
             print(
                 f"loading worker model={settings.model_name} node={settings.node_name} device={settings.device}",
@@ -141,14 +151,14 @@ def _serve(settings: Settings, *, preload: bool) -> int:
             )
             worker.engine.load()
         if settings.role == "worker":
-            print(
-                f"worker listening node={settings.node_name} tcp={settings.peer_host}:{settings.peer_port}",
-                flush=True,
-            )
             try:
                 worker.serve_forever()
             except KeyboardInterrupt:
+                pass
+            finally:
                 worker.stop()
+                if discovery_service is not None:
+                    discovery_service.stop()
             return 0
         worker.start_background()
         print(
@@ -156,12 +166,19 @@ def _serve(settings: Settings, *, preload: bool) -> int:
             flush=True,
         )
 
+    if settings.role in {"server", "both"} and settings.peer_discovery:
+        discovered = discover_peers(settings)
+        merged = merge_peers(settings.peers, discovered, local_node_name=settings.node_name)
+        if merged != settings.peers:
+            settings = replace(settings, peers=merged)
+
     local_engine = worker.engine if worker is not None and settings.load_local else None
     engine = DistributedInferenceEngine(settings, local_engine=local_engine)
 
+    print(startup_banner(settings, peers=settings.peers, title="server"), flush=True)
     if preload:
         print(
-            f"preparing coordinator model={settings.model_name} node={settings.node_name} "
+            f"preparing server model={settings.model_name} node={settings.node_name} "
             f"http={settings.host}:{settings.port}",
             flush=True,
         )
@@ -179,6 +196,8 @@ def _serve(settings: Settings, *, preload: bool) -> int:
     finally:
         if worker is not None:
             worker.stop()
+        if discovery_service is not None:
+            discovery_service.stop()
         time.sleep(0.1)
     return 0
 

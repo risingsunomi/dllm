@@ -34,9 +34,9 @@ class PeerState:
 class DistributedInferenceEngine:
     """Coordinator for local or multi-node inference.
 
-    In shard mode, one request flows through the server's local layer shard and
-    then each peer shard. Replica mode keeps the older full-request worker
-    load-balancing behavior.
+    One request flows through the server's local layer shard and then each peer
+    shard. With no peers configured or discovered, the server runs as a single
+    full-model node.
     """
 
     def __init__(
@@ -68,7 +68,6 @@ class DistributedInferenceEngine:
         )
         self.peers = [PeerState(spec=peer) for peer in settings.peers]
         self.local_shard: LayerShard | None = None
-        self._rr = 0
         self._lock = threading.RLock()
         self._ready = False
 
@@ -81,7 +80,7 @@ class DistributedInferenceEngine:
             if self.local_engine is not None:
                 self.local_engine.load()
             for peer in self.peers:
-                if self._using_shards() and peer.shard is None:
+                if peer.shard is None:
                     continue
                 try:
                     self._load_peer(peer)
@@ -96,69 +95,14 @@ class DistributedInferenceEngine:
         self.ensure_ready()
         if self._using_shards():
             return self._generate_sharded(payload)
-        errors: list[str] = []
-        for target in self._target_order():
-            if target == "local":
-                try:
-                    return self._generate_local(payload)
-                except Exception as exc:
-                    errors.append(f"local: {exc}")
-                    continue
-
-            assert isinstance(target, PeerState)
-            try:
-                response = self.peer_client.generate(target.spec.host, target.spec.port, payload)
-                target.healthy = True
-                target.loaded = True
-                target.last_error = ""
-                target.last_seen = time.time()
-                result = dict(response.get("payload", {}))
-                result["target"] = target.spec.name
-                result["distributed"] = len(self.peers) > 0
-                return result
-            except Exception as exc:
-                target.healthy = False
-                target.last_error = str(exc)
-                errors.append(f"{target.spec.name}: {exc}")
-
-        detail = "; ".join(errors) if errors else "no generation targets are configured"
-        raise RuntimeError(f"inference failed: {detail}")
+        return self._generate_local(payload)
 
     def stream(self, payload: dict[str, Any]):
         self.ensure_ready()
         if self._using_shards():
             yield from self._stream_sharded(payload)
             return
-        errors: list[str] = []
-        for target in self._target_order():
-            if target == "local":
-                try:
-                    yield from self._stream_local(payload)
-                    return
-                except Exception as exc:
-                    errors.append(f"local: {exc}")
-                    continue
-
-            assert isinstance(target, PeerState)
-            try:
-                for event in self.peer_client.generate_stream(target.spec.host, target.spec.port, payload):
-                    event_out = dict(event)
-                    if event_out.get("event") == "done":
-                        target.healthy = True
-                        target.loaded = True
-                        target.last_error = ""
-                        target.last_seen = time.time()
-                        event_out["target"] = target.spec.name
-                        event_out["distributed"] = len(self.peers) > 0
-                    yield event_out
-                return
-            except Exception as exc:
-                target.healthy = False
-                target.last_error = str(exc)
-                errors.append(f"{target.spec.name}: {exc}")
-
-        detail = "; ".join(errors) if errors else "no generation targets are configured"
-        raise RuntimeError(f"inference stream failed: {detail}")
+        yield from self._stream_local(payload)
 
     def health(self, *, probe_peers: bool = False) -> dict[str, Any]:
         if probe_peers:
@@ -169,7 +113,7 @@ class DistributedInferenceEngine:
             "model_name": self.settings.model_name,
             "device": self.settings.device,
             "ready": self._ready,
-            "distribution_mode": self.settings.distribution_mode,
+            "runtime": "sharded" if self._using_shards() else "single-node",
             "local_shard": self.local_shard.as_dict() if self.local_shard is not None else None,
             "local": self.local_engine.health() if self.local_engine is not None else None,
             "peers": [peer.as_dict() for peer in self.peers],
@@ -219,7 +163,7 @@ class DistributedInferenceEngine:
             raise
 
     def _plan_shards(self) -> None:
-        if self.settings.distribution_mode != "shard" or not self.peers or self.local_engine is None:
+        if not self.peers or self.local_engine is None:
             self.local_shard = None
             if self.local_engine is not None:
                 self.local_engine.set_shard(None)
@@ -344,6 +288,7 @@ class DistributedInferenceEngine:
             "distributed": True,
             "shards": self._shard_summary(),
         }
+        _log_tokens_per_second(done)
         yield done
 
     def _forward_peer_shard(self, peer: PeerState, payload: dict[str, Any]) -> dict[str, Any]:
@@ -368,19 +313,6 @@ class DistributedInferenceEngine:
                 summary.append({"node_name": peer.spec.name, "shard": peer.shard.as_dict()})
         return summary
 
-    def _target_order(self) -> list[str | PeerState]:
-        with self._lock:
-            remote_targets = [peer for peer in self.peers if peer.healthy or not peer.last_error]
-            targets: list[str | PeerState] = []
-            if self.local_engine is not None:
-                targets.append("local")
-            targets.extend(remote_targets)
-            if not targets:
-                return []
-            start = self._rr % len(targets)
-            self._rr += 1
-            return targets[start:] + targets[:start]
-
     def _generate_local(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.local_engine is None:
             raise RuntimeError("local inference is disabled")
@@ -393,7 +325,8 @@ class DistributedInferenceEngine:
         result = self.local_engine.generate(request).as_dict()
         result["node_name"] = self.settings.node_name
         result["target"] = "local"
-        result["distributed"] = len(self.peers) > 0
+        result["distributed"] = False
+        _log_tokens_per_second(result)
         return result
 
     def _stream_local(self, payload: dict[str, Any]):
@@ -410,7 +343,8 @@ class DistributedInferenceEngine:
             if event_out.get("event") == "done":
                 event_out["node_name"] = self.settings.node_name
                 event_out["target"] = "local"
-                event_out["distributed"] = len(self.peers) > 0
+                event_out["distributed"] = False
+                _log_tokens_per_second(event_out)
             yield event_out
 
 
@@ -471,3 +405,18 @@ def _longest_stop_prefix_suffix(text: str, stop: tuple[str, ...]) -> int:
                 longest = max(longest, size)
                 break
     return longest
+
+
+def _log_tokens_per_second(result: dict[str, Any]) -> None:
+    generated = int(result.get("generated_tokens", 0) or 0)
+    elapsed = float(result.get("elapsed_seconds", 0.0) or 0.0)
+    tok_s = float(result.get("tokens_per_second", 0.0) or 0.0)
+    if tok_s <= 0 and elapsed > 0:
+        tok_s = generated / elapsed
+    print(
+        "generation complete "
+        f"target={result.get('target', 'unknown')} "
+        f"model={result.get('model_name', '')} "
+        f"tokens={generated} elapsed={elapsed:.3f}s tok_s={tok_s:.2f}",
+        flush=True,
+    )

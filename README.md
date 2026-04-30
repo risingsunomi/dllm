@@ -1,6 +1,6 @@
 # dllm
 
-Standalone distributed inference server using [PyTorch](https://github.com/pytorch/pytorch). Supports MoE, Non-MoE and language part only of vision language models.
+Standalone shard-first distributed inference server using [PyTorch](https://github.com/pytorch/pytorch). Supports MoE, Non-MoE and language part only of vision language models.
 
 ## Install
 
@@ -167,16 +167,26 @@ Local servers can skip the API key. If you want Hermes to auto-detect context le
 
 ## Multiple Nodes
 
-The default multi-node mode is layer sharding. The server node is the first shard and owns the HTTP API; peer nodes load later contiguous transformer layer ranges. During generation, hidden states flow from the server shard through each peer shard, and the final shard applies norm/lm_head and samples the next token.
+Multi-node execution is layer sharded. The server node is the first shard and owns the HTTP API; peer nodes load later contiguous transformer layer ranges. During generation, hidden states flow from the server shard through each peer shard, and the final shard applies norm/lm_head and samples the next token.
 
-Start peer nodes:
+Start peer nodes. Peers respond to LAN discovery by default:
 
 ```bash
 python -m dllm.cli serve --role worker --model-name Qwen/Qwen2.5-0.5B-Instruct --node-name node-b --device cuda --peer-host 0.0.0.0 --peer-port 8765
 python -m dllm.cli serve --role worker --model-name Qwen/Qwen2.5-0.5B-Instruct --node-name node-c --device cuda --peer-host 0.0.0.0 --peer-port 8765
 ```
 
-Start the server node. Keep local loading enabled; this node runs the first shard, so `--no-load-local` is only valid with `--distribution-mode replica`:
+Start the server node. Keep local loading enabled; this node runs the first shard:
+
+```bash
+python -m dllm.cli serve \
+  --role server \
+  --model-name Qwen/Qwen2.5-0.5B-Instruct \
+  --node-name node-a \
+  --device cuda
+```
+
+You can still assign peers explicitly; manual peers are merged with LAN-discovered peers:
 
 ```bash
 python -m dllm.cli serve \
@@ -184,7 +194,6 @@ python -m dllm.cli serve \
   --model-name Qwen/Qwen2.5-0.5B-Instruct \
   --node-name node-a \
   --device cuda \
-  --distribution-mode shard \
   --peers node-b@192.168.0.5:8765,node-c@192.168.0.6:8765
 ```
 
@@ -195,7 +204,7 @@ Shard convention follows Cheetah's Python runtime:
 - `total_layers = num_hidden_layers + 1`.
 - The extra virtual layer is the final norm/lm_head stage on the last shard.
 
-The coordinator exposes:
+The server exposes:
 
 - `GET /health`
 - `GET /peers`
@@ -204,7 +213,7 @@ The coordinator exposes:
 - `POST /v1/completions`
 - `POST /v1/chat/completions`
 
-To use the old full-model worker behavior, start every worker with enough memory for the whole model and pass `--distribution-mode replica`. Replica mode load-balances complete requests across full-model workers; shard mode splits one request across the server and peers.
+Disable LAN discovery with `--no-peer-discovery` or `DLLM_PEER_DISCOVERY=false`. Startup prints the DLLM banner, resolved LAN IPs, model, role, bind addresses, discovery settings, and peer list. Generation logs include elapsed time and tokens/sec.
 
 ## License
 

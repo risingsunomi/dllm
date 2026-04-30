@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from . import __version__
 from .config import Settings
 from .distributed import DistributedInferenceEngine
 from .tools import extract_tool_calls, wants_tool_calls
@@ -26,7 +27,7 @@ def run_http_server(settings: Settings, engine: DistributedInferenceEngine) -> N
 
 def _make_handler(settings: Settings, engine: DistributedInferenceEngine):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "dllm/0.1"
+        server_version = f"dllm/{__version__}"
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)

@@ -37,7 +37,9 @@ class Settings:
     peer_port: int = 8765
     peers: tuple[PeerSpec, ...] = ()
     load_local: bool = True
-    distribution_mode: str = "shard"
+    peer_discovery: bool = True
+    discovery_port: int = 8764
+    discovery_timeout: float = 1.0
     offline: bool = False
     dtype: str = "auto"
     trust_remote_code: bool = False
@@ -71,9 +73,6 @@ class Settings:
         role = str(pick("role", "DLLM_ROLE", "server") or "server").strip().lower()
         if role not in {"server", "worker", "both"}:
             raise ValueError("role must be one of: server, worker, both")
-        distribution_mode = str(pick("distribution_mode", "DLLM_DISTRIBUTION_MODE", "shard") or "shard").strip().lower()
-        if distribution_mode not in {"shard", "replica"}:
-            raise ValueError("distribution_mode must be one of: shard, replica")
 
         model_name = str(pick("model_name", "DLLM_MODEL_NAME", "") or "").strip()
         peers_value = pick("peers", "DLLM_PEERS", "") or ""
@@ -89,7 +88,9 @@ class Settings:
             peer_port=_int(pick("peer_port", "DLLM_PEER_PORT", 8765), 8765),
             peers=tuple(parse_peers(peers_value)),
             load_local=_bool(pick("load_local", "DLLM_LOAD_LOCAL", True), True),
-            distribution_mode=distribution_mode,
+            peer_discovery=_bool(pick("peer_discovery", "DLLM_PEER_DISCOVERY", True), True),
+            discovery_port=_int(pick("discovery_port", "DLLM_DISCOVERY_PORT", 8764), 8764),
+            discovery_timeout=_float(pick("discovery_timeout", "DLLM_DISCOVERY_TIMEOUT", 1.0), 1.0),
             offline=_bool(pick("offline", "DLLM_OFFLINE", False), False),
             dtype=str(pick("dtype", "DLLM_DTYPE", "auto") or "auto"),
             trust_remote_code=_bool(pick("trust_remote_code", "DLLM_TRUST_REMOTE_CODE", False), False),
@@ -124,10 +125,8 @@ class Settings:
     def validate_for_runtime(self) -> None:
         if not self.model_name:
             raise ValueError("model name is required; set DLLM_MODEL_NAME or pass --model-name")
-        if self.role == "server" and not self.load_local and not self.peers:
-            raise ValueError("--no-load-local requires at least one --peers entry")
-        if self.distribution_mode == "shard" and self.peers and not self.load_local:
-            raise ValueError("shard distribution requires the server node to load the first local shard")
+        if self.role in {"server", "both"} and not self.load_local:
+            raise ValueError("the server node must load the first shard; do not use --no-load-local")
 
     def generation_defaults(self) -> dict[str, Any]:
         return {
