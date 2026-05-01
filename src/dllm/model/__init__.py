@@ -79,6 +79,14 @@ class StreamEvent:
         return payload
 
 
+@dataclass(frozen=True)
+class CheckpointSource:
+    model_name: str
+    root: Path
+    offline: bool = False
+    is_remote: bool = False
+
+
 class TorchTransformersEngine:
     """Small PyTorch/Transformers causal language model engine.
 
@@ -1517,10 +1525,10 @@ def _load_sharded_causal_lm(
     _trim_model_to_shard(model, shard, torch)
     _materialize_empty_model(model, device=device, dtype=dtype, torch=torch)
 
-    checkpoint_dir = _resolve_checkpoint_dir(model_name, offline=offline)
+    checkpoint_source = _resolve_checkpoint_source(model_name, offline=offline)
     load_info = _load_safetensor_shard_weights(
         model,
-        checkpoint_dir,
+        checkpoint_source,
         key_mapping=key_mapping,
         device=device,
         torch=torch,
@@ -1528,7 +1536,8 @@ def _load_sharded_causal_lm(
     _drop_non_shard_layers(model, shard, torch)
     model.dllm_shard_load = {  # type: ignore[attr-defined]
         **load_info,
-        "checkpoint_dir": str(checkpoint_dir),
+        "checkpoint_dir": str(checkpoint_source.root),
+        "remote": checkpoint_source.is_remote,
         "shard": shard.as_dict(),
     }
     return model
@@ -1650,12 +1659,12 @@ def _target_tensor_dtype(tensor: Any, requested_dtype: Any | None) -> Any:
     return current
 
 
-def _resolve_checkpoint_dir(model_name: str, *, offline: bool) -> Path:
+def _resolve_checkpoint_source(model_name: str, *, offline: bool) -> CheckpointSource:
     candidate = Path(model_name).expanduser()
     if candidate.exists():
         if candidate.is_dir():
-            return candidate
-        return candidate.parent
+            return CheckpointSource(model_name=model_name, root=candidate, offline=offline, is_remote=False)
+        return CheckpointSource(model_name=model_name, root=candidate.parent, offline=offline, is_remote=False)
 
     try:
         from huggingface_hub import snapshot_download
@@ -1667,8 +1676,6 @@ def _resolve_checkpoint_dir(model_name: str, *, offline: bool) -> Path:
             repo_id=model_name,
             local_files_only=offline,
             allow_patterns=[
-                "*.safetensors",
-                "**/*.safetensors",
                 "*.safetensors.index.json",
                 "**/*.safetensors.index.json",
                 "config.json",
@@ -1677,13 +1684,15 @@ def _resolve_checkpoint_dir(model_name: str, *, offline: bool) -> Path:
         )
     except Exception as exc:
         mode = "cached" if offline else "downloaded or cached"
-        raise RuntimeError(f"could not resolve {mode} safetensors checkpoint for {model_name!r}") from exc
-    return Path(resolved)
+        raise RuntimeError(
+            f"could not resolve {mode} safetensors index for {model_name!r}: {exc}"
+        ) from exc
+    return CheckpointSource(model_name=model_name, root=Path(resolved), offline=offline, is_remote=True)
 
 
 def _load_safetensor_shard_weights(
     model: Any,
-    checkpoint_dir: Path,
+    checkpoint: CheckpointSource,
     *,
     key_mapping: dict[str, str],
     device: str,
@@ -1694,7 +1703,7 @@ def _load_safetensor_shard_weights(
     except Exception as exc:
         raise RuntimeError("safetensors is required for shard-native loading") from exc
 
-    weight_map = _safetensor_weight_map(checkpoint_dir)
+    weight_map = _safetensor_weight_map(checkpoint)
     if not weight_map:
         raise RuntimeError(
             "shard-native loading requires safetensors weights; no *.safetensors files were found"
@@ -1723,9 +1732,7 @@ def _load_safetensor_shard_weights(
 
     loaded: set[str] = set()
     for filename, pairs in sorted(by_file.items()):
-        file_path = checkpoint_dir / filename
-        if not file_path.exists():
-            raise RuntimeError(f"checkpoint shard file is missing: {file_path}")
+        file_path = _resolve_checkpoint_file(checkpoint, filename)
         partial: dict[str, Any] = {}
         with safe_open(str(file_path), framework="pt", device="cpu") as handle:
             keys = set(handle.keys())
@@ -1735,7 +1742,7 @@ def _load_safetensor_shard_weights(
                 target = state.get(target_key)
                 if _is_mxfp4_blocks_key(source_key):
                     tensor = _load_mxfp4_projection(
-                        checkpoint_dir,
+                        checkpoint,
                         weight_map,
                         source_key,
                         target=target,
@@ -1782,8 +1789,8 @@ def _load_safetensor_shard_weights(
     }
 
 
-def _safetensor_weight_map(checkpoint_dir: Path) -> dict[str, str]:
-    index_path = _preferred_weight_index_path(checkpoint_dir)
+def _safetensor_weight_map(checkpoint: CheckpointSource) -> dict[str, str]:
+    index_path = _preferred_weight_index_path(checkpoint.root)
     if index_path is not None:
         try:
             payload = json.loads(index_path.read_text(encoding="utf-8"))
@@ -1799,11 +1806,36 @@ def _safetensor_weight_map(checkpoint_dir: Path) -> dict[str, str]:
     except Exception as exc:
         raise RuntimeError("safetensors is required for shard-native loading") from exc
     result: dict[str, str] = {}
-    for file_path in sorted(checkpoint_dir.glob("*.safetensors")):
+    for file_path in sorted(checkpoint.root.glob("*.safetensors")):
         with safe_open(str(file_path), framework="pt", device="cpu") as handle:
             for key in handle.keys():
                 result[str(key)] = file_path.name
     return result
+
+
+def _resolve_checkpoint_file(checkpoint: CheckpointSource, filename: str) -> Path:
+    local_path = checkpoint.root / filename
+    if local_path.exists():
+        return local_path
+    if not checkpoint.is_remote:
+        raise RuntimeError(f"checkpoint shard file is missing: {local_path}")
+    try:
+        from huggingface_hub import hf_hub_download
+    except Exception as exc:
+        raise RuntimeError("huggingface-hub is required to download remote checkpoint shards") from exc
+    try:
+        resolved = hf_hub_download(
+            repo_id=checkpoint.model_name,
+            filename=filename,
+            local_files_only=checkpoint.offline,
+        )
+    except Exception as exc:
+        mode = "cached" if checkpoint.offline else "downloaded or cached"
+        raise RuntimeError(
+            f"could not resolve {mode} checkpoint shard {filename!r} for "
+            f"{checkpoint.model_name!r}: {exc}"
+        ) from exc
+    return Path(resolved)
 
 
 def _mapped_checkpoint_key(source_key: str, key_mapping: dict[str, str]) -> str:
@@ -1870,7 +1902,7 @@ def _is_mxfp4_blocks_key(key: str) -> bool:
 
 
 def _load_mxfp4_projection(
-    checkpoint_dir: Path,
+    checkpoint: CheckpointSource,
     weight_map: dict[str, str],
     blocks_key: str,
     *,
@@ -1880,8 +1912,8 @@ def _load_mxfp4_projection(
     scales_key = f"{blocks_key[: -len('_blocks')]}_scales"
     if scales_key not in weight_map:
         raise RuntimeError(f"MXFP4 checkpoint is missing scale tensor for {blocks_key}")
-    blocks = _load_weight_tensor_by_key(checkpoint_dir, weight_map, blocks_key)
-    scales = _load_weight_tensor_by_key(checkpoint_dir, weight_map, scales_key)
+    blocks = _load_weight_tensor_by_key(checkpoint, weight_map, blocks_key)
+    scales = _load_weight_tensor_by_key(checkpoint, weight_map, scales_key)
     decoded = _decode_mxfp4_blocks(blocks, scales, torch)
     if _is_tensor_like(target) and tuple(decoded.shape) != tuple(target.shape):
         transposed = decoded.transpose(-1, -2).contiguous()
@@ -1890,12 +1922,12 @@ def _load_mxfp4_projection(
     return decoded
 
 
-def _load_weight_tensor_by_key(checkpoint_dir: Path, weight_map: dict[str, str], key: str) -> Any:
+def _load_weight_tensor_by_key(checkpoint: CheckpointSource, weight_map: dict[str, str], key: str) -> Any:
     try:
         from safetensors import safe_open
     except Exception as exc:
         raise RuntimeError("safetensors is required for MXFP4 expert loading") from exc
-    file_path = checkpoint_dir / str(weight_map[key])
+    file_path = _resolve_checkpoint_file(checkpoint, str(weight_map[key]))
     with safe_open(str(file_path), framework="pt", device="cpu") as handle:
         return handle.get_tensor(key)
 
