@@ -1,6 +1,17 @@
+<div align="center">
+<pre>
+ ######     ##      ##      ##      ##
+ ##   ##    ##      ##      ####  ####
+ ##    ##   ##      ##      ## #### ##
+ ##   ##    ##      ##      ##  ##  ##
+ ######     ######  ######  ##      ##
+    D I S T R I B U T E D   L L M
+</pre>
+</div>
+
 # dllm
 
-Standalone shard-first distributed inference server using [PyTorch](https://github.com/pytorch/pytorch). Supports MoE, Non-MoE and language part only of vision language models.
+Standalone shard-first distributed inference server using [PyTorch](https://github.com/pytorch/pytorch). Supports MoE, non-MoE, and language-only loading for text use of vision-language repositories.
 
 ## Install
 
@@ -10,7 +21,7 @@ python3 -m venv .venv
 pip install -e .
 ```
 
-If you already have a Python environment with PyTorch and Transformers installed, activate it and install this package there:
+If you already have a Python environment with [PyTorch](https://github.com/pytorch/pytorch) and [Transformers](https://github.com/huggingface/transformers) installed, activate it and install this package there:
 
 ```bash
 python -m pip install -e .
@@ -30,11 +41,25 @@ curl -s http://127.0.0.1:8000/generate \
   -d '{"prompt":"Write a concise test sentence.","max_new_tokens":32}'
 ```
 
+## Basic LLM Models
+
+For standard decoder-only LLMs, `dllm` serves text generation through [PyTorch](https://github.com/pytorch/pytorch) and the model's [Transformers](https://github.com/huggingface/transformers) causal language model implementation. On one machine, it behaves like a lightweight local inference server with `/generate` and OpenAI-compatible `/v1/chat/completions` endpoints.
+
+When peers are configured, the same model is split by contiguous transformer layer ranges. The server node keeps the tokenizer, prompt formatting, HTTP API, and first layer shard. Worker nodes load later layer shards. During generation, hidden states move from shard to shard, and the final shard applies the last norm/lm_head and samples the next token. Each node loads only the weights needed for its assigned shard.
+
+Use `/v1/chat/completions` for instruct/chat models so the tokenizer chat template is applied. `/generate` sends the prompt as raw text and is better for simple completion-style tests.
+
 ## MoE Models
 
-MoE architectures are supported through [PyTorch](https://github.com/pytorch/pytorch) + [Transformers](https://github.com/huggingface/transformers) `AutoModelForCausalLM`. The model implementation handles expert routing, while `dllm` handles serving, streaming, tool calls, and worker distribution.
+MoE models are supported in two different runtime modes.
 
-For large MoE models, use Transformers device mapping and optional CPU/disk offload:
+On a single node, `dllm` uses the model's [Transformers](https://github.com/huggingface/transformers) implementation through `AutoModelForCausalLM`. That path is useful when one machine can hold the model, or when you want [Transformers](https://github.com/huggingface/transformers) to place modules across local GPU/CPU/disk with `device_map`, `max_memory`, and `offload_folder`.
+
+On multiple nodes, `dllm` uses shard-native loading. The server builds a layer plan, each node constructs the model on `meta`, drops layers outside its assigned range, and loads only the checkpoint tensors required by that shard. Expert routing stays inside the model layers loaded on each shard. For packed MoE checkpoints such as GPT-OSS MXFP4 experts, `dllm` maps packed expert tensors to the shard parameters during load.
+
+`device_map` and `max_memory` do not distribute a model across machines. They are local [Transformers](https://github.com/huggingface/transformers) placement controls. Multi-node distribution requires a server plus one or more worker peers, as shown in the Multiple Nodes section.
+
+Single-node MoE example with local [Transformers](https://github.com/huggingface/transformers) placement:
 
 ```bash
 python -m dllm.cli serve \
@@ -60,7 +85,34 @@ DLLM_OFFLOAD_FOLDER=.dllm-offload
 DLLM_ATTENTION_IMPLEMENTATION=sdpa
 ```
 
-Use `--trust-remote-code` only for models that require custom model code. `GET /health` reports MoE metadata when the loaded model config exposes expert fields such as `num_local_experts`, `num_experts`, or `num_experts_per_tok`.
+Distributed MoE example:
+
+```bash
+# node-b
+python3 -m dllm.cli serve \
+  --role worker \
+  --model-name openai/gpt-oss-20b \
+  --node-name node-b \
+  --device auto \
+  --peer-host 0.0.0.0 \
+  --peer-port 8765 \
+  --no-peer-discovery \
+  --request-timeout 3600
+
+# node-a
+python3 -m dllm.cli serve \
+  --role server \
+  --model-name openai/gpt-oss-20b \
+  --node-name node-a \
+  --device auto \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --peers node-b@192.168.0.5:8765 \
+  --no-peer-discovery \
+  --request-timeout 3600
+```
+
+On first use, each node resolves the checkpoint index, determines which safetensor files contain its shard's parameters, and downloads only those files. `GET /health` reports MoE metadata when the loaded model config exposes expert fields such as `num_local_experts`, `num_experts`, or `num_experts_per_tok`, and also reports shard-loading details after weights are loaded. Use `--trust-remote-code` only for models that require custom model code.
 
 ## Vision-Language Repos As Language Models
 
@@ -87,7 +139,7 @@ python -m dllm.cli serve \
   --language-weight-prefix language_model.
 ```
 
-For nonstandard text checkpoints whose safetensor keys do not use the usual `model.*` prefix, leave them alone when the model's own Transformers implementation expects that layout. If you need to adapt such weights to a standard CausalLM class, pass an explicit Transformers key map. The left side is a Python regular expression pattern and the right side is its replacement:
+For nonstandard text checkpoints whose safetensor keys do not use the usual `model.*` prefix, leave them alone when the model's own [Transformers](https://github.com/huggingface/transformers) implementation expects that layout. If you need to adapt such weights to a standard CausalLM class, pass an explicit [Transformers](https://github.com/huggingface/transformers) key map. The left side is a Python regular expression pattern and the right side is its replacement:
 
 ```bash
 python -m dllm.cli serve \
@@ -169,9 +221,9 @@ Local servers can skip the API key. If you want Hermes to auto-detect context le
 
 Multi-node execution is layer sharded. The server node is the first shard and owns the HTTP API; peer nodes load later contiguous transformer layer ranges. During generation, hidden states flow from the server shard through each peer shard, and the final shard applies norm/lm_head and samples the next token.
 
-Startup does not load model weights on either server or worker nodes. On the first inference request, the server formats the prompt, counts prefill tokens, probes peer hardware, builds a shard plan from detected CPU/GPU memory, and sends each worker only its shard assignment. Each node then builds the Transformers model on `meta` and loads only the safetensor keys needed for its assigned shard.
+Startup does not load model weights on either server or worker nodes. On the first inference request, the server formats the prompt, counts prefill tokens, probes peer hardware, builds a shard plan from detected CPU/GPU memory, and sends each worker only its shard assignment. Each node then builds the [Transformers](https://github.com/huggingface/transformers) model on `meta` and loads only the safetensor keys needed for its assigned shard.
 
-`--device-map` and `--max-memory` are single-process Transformers placement options. They are useful for one node, but they do not distribute a model across machines. For multi-node runs, start workers and pass them to the server as peers.
+`--device-map` and `--max-memory` are single-process [Transformers](https://github.com/huggingface/transformers) placement options. They are useful for one node, but they do not distribute a model across machines. For multi-node runs, start workers and pass them to the server as peers.
 
 Start peer nodes first:
 
