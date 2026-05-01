@@ -103,7 +103,6 @@ class TorchTransformersEngine:
         offline: bool = False,
         trust_remote_code: bool = False,
         device_map: str = "",
-        max_memory: str = "",
         offload_folder: str = "",
         attention_implementation: str = "",
         language_only: bool = True,
@@ -117,7 +116,6 @@ class TorchTransformersEngine:
         self.offline = bool(offline)
         self.trust_remote_code = bool(trust_remote_code)
         self.device_map_name = str(device_map or "")
-        self.max_memory = str(max_memory or "")
         self.offload_folder = str(offload_folder or "")
         self.attention_implementation = str(attention_implementation or "")
         self.language_only = bool(language_only)
@@ -184,9 +182,6 @@ class TorchTransformersEngine:
                 model_kwargs["torch_dtype"] = dtype
             if device_map is not None:
                 model_kwargs["device_map"] = device_map
-                max_memory = _parse_max_memory(self.max_memory)
-                if max_memory:
-                    model_kwargs["max_memory"] = max_memory
                 if self.offload_folder:
                     model_kwargs["offload_folder"] = self.offload_folder
             if self.attention_implementation:
@@ -598,7 +593,6 @@ class TorchTransformersEngine:
             "input_device": self.input_device,
             "dtype": self.dtype_name,
             "device_map": self.device_map_name,
-            "max_memory": self.max_memory,
             "offload_folder": self.offload_folder,
             "attention_implementation": self.attention_implementation,
             "language_only": self.language_only,
@@ -1120,28 +1114,6 @@ def _parse_device_map(value: str) -> Any | None:
     return text
 
 
-def _parse_max_memory(value: str) -> dict[Any, str]:
-    text = str(value or "").strip()
-    if not text:
-        return {}
-    if text.startswith("{"):
-        parsed = json.loads(text)
-        if not isinstance(parsed, dict):
-            raise ValueError("max_memory JSON must be an object")
-        return {_memory_key(key): str(amount) for key, amount in parsed.items()}
-
-    result: dict[Any, str] = {}
-    for chunk in text.replace(";", ",").split(","):
-        item = chunk.strip()
-        if not item:
-            continue
-        if "=" not in item:
-            raise ValueError("max_memory entries must use key=value syntax")
-        key, amount = item.split("=", 1)
-        result[_memory_key(key.strip())] = amount.strip()
-    return result
-
-
 def _parse_weight_key_mapping(value: str, model_name: str, *, offline: bool) -> dict[str, str]:
     text = str(value or "").strip()
     if not text:
@@ -1388,13 +1360,6 @@ def _ensure_trailing_dot(value: str) -> str:
     text = str(value or "").strip()
     if text and not text.endswith("."):
         return f"{text}."
-    return text
-
-
-def _memory_key(value: Any) -> Any:
-    text = str(value).strip()
-    if text.isdigit():
-        return int(text)
     return text
 
 

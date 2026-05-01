@@ -11,7 +11,6 @@ from dllm.model import (
     _moe_metadata,
     _nested_language_config_dict,
     _parse_device_map,
-    _parse_max_memory,
     _parse_weight_key_mapping,
     _weight_index_sample_keys,
 )
@@ -75,10 +74,6 @@ class ModelLoadingOptionsTests(unittest.TestCase):
         self.assertIsNone(_parse_device_map("none"))
         self.assertEqual(_parse_device_map("auto"), "auto")
         self.assertEqual(_parse_device_map('{"model.embed_tokens":"cuda:0"}'), {"model.embed_tokens": "cuda:0"})
-
-    def test_parse_max_memory(self) -> None:
-        self.assertEqual(_parse_max_memory("0=20GiB,cpu=80GiB"), {0: "20GiB", "cpu": "80GiB"})
-        self.assertEqual(_parse_max_memory('{"0":"10GiB","cpu":"48GiB"}'), {0: "10GiB", "cpu": "48GiB"})
 
     def test_moe_metadata(self) -> None:
         meta = _moe_metadata(

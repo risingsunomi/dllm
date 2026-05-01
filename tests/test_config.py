@@ -39,7 +39,6 @@ class ConfigTests(unittest.TestCase):
             {
                 "model_name": "mixtral",
                 "device_map": "auto",
-                "max_memory": "0=20GiB,cpu=80GiB",
                 "offload_folder": ".offload",
                 "attention_implementation": "sdpa",
                 "peer_discovery": False,
@@ -51,7 +50,6 @@ class ConfigTests(unittest.TestCase):
             }
         )
         self.assertEqual(settings.device_map, "auto")
-        self.assertEqual(settings.max_memory, "0=20GiB,cpu=80GiB")
         self.assertEqual(settings.offload_folder, ".offload")
         self.assertEqual(settings.attention_implementation, "sdpa")
         self.assertFalse(settings.peer_discovery)

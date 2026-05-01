@@ -53,11 +53,11 @@ Use `/v1/chat/completions` for instruct/chat models so the tokenizer chat templa
 
 MoE models are supported in two different runtime modes.
 
-On a single node, `dllm` uses the model's [Transformers](https://github.com/huggingface/transformers) implementation through `AutoModelForCausalLM`. That path is useful when one machine can hold the model, or when you want [Transformers](https://github.com/huggingface/transformers) to place modules across local GPU/CPU/disk with `device_map`, `max_memory`, and `offload_folder`.
+On a single node, `dllm` uses the model's [Transformers](https://github.com/huggingface/transformers) implementation through `AutoModelForCausalLM`. That path is useful when one machine can hold the model, or when you want [Transformers](https://github.com/huggingface/transformers) to place modules across local GPU/CPU/disk with `device_map` and `offload_folder`.
 
 On multiple nodes, `dllm` uses shard-native loading. The server builds a layer plan, each node constructs the model on `meta`, drops layers outside its assigned range, and loads only the checkpoint tensors required by that shard. Expert routing stays inside the model layers loaded on each shard. For packed MoE checkpoints such as GPT-OSS MXFP4 experts, `dllm` maps packed expert tensors to the shard parameters during load.
 
-`device_map` and `max_memory` do not distribute a model across machines. They are local [Transformers](https://github.com/huggingface/transformers) placement controls. Multi-node distribution requires a server plus one or more worker peers, as shown in the Multiple Nodes section.
+`device_map` does not distribute a model across machines. It is a local [Transformers](https://github.com/huggingface/transformers) placement control. Multi-node distribution uses device-info probing and shard planning, and requires a server plus one or more worker peers, as shown in the Multiple Nodes section.
 
 Single-node MoE example with local [Transformers](https://github.com/huggingface/transformers) placement:
 
@@ -68,7 +68,6 @@ python -m dllm.cli serve \
   --device cuda \
   --dtype bf16 \
   --device-map auto \
-  --max-memory '0=20GiB,cpu=80GiB' \
   --offload-folder .dllm-offload \
   --attention-implementation sdpa
 ```
@@ -80,7 +79,6 @@ DLLM_MODEL_NAME=mistralai/Mixtral-8x7B-Instruct-v0.1
 DLLM_DEVICE=cuda
 DLLM_DTYPE=bf16
 DLLM_DEVICE_MAP=auto
-DLLM_MAX_MEMORY=0=20GiB,cpu=80GiB
 DLLM_OFFLOAD_FOLDER=.dllm-offload
 DLLM_ATTENTION_IMPLEMENTATION=sdpa
 ```
@@ -223,7 +221,7 @@ Multi-node execution is layer sharded. The server node is the first shard and ow
 
 Startup does not load model weights on either server or worker nodes. On the first inference request, the server formats the prompt, counts prefill tokens, probes peer hardware, builds a shard plan from detected CPU/GPU memory, and sends each worker only its shard assignment. Each node then builds the [Transformers](https://github.com/huggingface/transformers) model on `meta` and loads only the safetensor keys needed for its assigned shard.
 
-`--device-map` and `--max-memory` are single-process [Transformers](https://github.com/huggingface/transformers) placement options. They are useful for one node, but they do not distribute a model across machines. For multi-node runs, start workers and pass them to the server as peers.
+`--device-map` is a single-process [Transformers](https://github.com/huggingface/transformers) placement option. It is useful for one node, but it does not distribute a model across machines. For multi-node runs, start workers and pass them to the server as peers; memory-aware shard sizing comes from device-info probing.
 
 Start peer nodes first:
 

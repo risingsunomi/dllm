@@ -47,7 +47,6 @@ class PeerClient:
         offline: bool | None = None,
         trust_remote_code: bool | None = None,
         device_map: str | None = None,
-        max_memory: str | None = None,
         offload_folder: str | None = None,
         attention_implementation: str | None = None,
         language_only: bool | None = None,
@@ -66,8 +65,6 @@ class PeerClient:
             payload["trust_remote_code"] = trust_remote_code
         if device_map:
             payload["device_map"] = device_map
-        if max_memory:
-            payload["max_memory"] = max_memory
         if offload_folder:
             payload["offload_folder"] = offload_folder
         if attention_implementation:
@@ -124,7 +121,6 @@ class InferenceWorker:
             offline=settings.offline,
             trust_remote_code=settings.trust_remote_code,
             device_map=settings.device_map,
-            max_memory=settings.max_memory,
             offload_folder=settings.offload_folder,
             attention_implementation=settings.attention_implementation,
             language_only=settings.language_only,
@@ -201,7 +197,6 @@ class InferenceWorker:
             requested_offline = bool(payload.get("offline", self.engine.offline))
             requested_trust = bool(payload.get("trust_remote_code", self.engine.trust_remote_code))
             requested_device_map = str(payload.get("device_map") or self.engine.device_map_name).strip()
-            requested_max_memory = str(payload.get("max_memory") or self.engine.max_memory).strip()
             requested_offload_folder = str(payload.get("offload_folder") or self.engine.offload_folder).strip()
             requested_attention = str(
                 payload.get("attention_implementation") or self.engine.attention_implementation
@@ -220,7 +215,6 @@ class InferenceWorker:
                 and requested_offline == self.engine.offline
                 and requested_trust == self.engine.trust_remote_code
                 and requested_device_map == self.engine.device_map_name
-                and requested_max_memory == self.engine.max_memory
                 and requested_offload_folder == self.engine.offload_folder
                 and requested_attention == self.engine.attention_implementation
                 and requested_language_only == self.engine.language_only
@@ -237,7 +231,6 @@ class InferenceWorker:
                     offline=requested_offline,
                     trust_remote_code=requested_trust,
                     device_map=requested_device_map,
-                    max_memory=requested_max_memory,
                     offload_folder=requested_offload_folder,
                     attention_implementation=requested_attention,
                     language_only=requested_language_only,

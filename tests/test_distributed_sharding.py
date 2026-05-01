@@ -79,7 +79,6 @@ class _FakeWorkerEngine:
         offline: bool = False,
         trust_remote_code: bool = False,
         device_map: str = "",
-        max_memory: str = "",
         offload_folder: str = "",
         attention_implementation: str = "",
         language_only: bool = True,
@@ -93,7 +92,6 @@ class _FakeWorkerEngine:
         self.offline = offline
         self.trust_remote_code = trust_remote_code
         self.device_map_name = device_map
-        self.max_memory = max_memory
         self.offload_folder = offload_folder
         self.attention_implementation = attention_implementation
         self.language_only = language_only

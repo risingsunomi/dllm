@@ -44,7 +44,6 @@ class Settings:
     dtype: str = "auto"
     trust_remote_code: bool = False
     device_map: str = ""
-    max_memory: str = ""
     offload_folder: str = ""
     attention_implementation: str = ""
     language_only: bool = True
@@ -95,7 +94,6 @@ class Settings:
             dtype=str(pick("dtype", "DLLM_DTYPE", "auto") or "auto"),
             trust_remote_code=_bool(pick("trust_remote_code", "DLLM_TRUST_REMOTE_CODE", False), False),
             device_map=str(pick("device_map", "DLLM_DEVICE_MAP", "") or ""),
-            max_memory=str(pick("max_memory", "DLLM_MAX_MEMORY", "") or ""),
             offload_folder=str(pick("offload_folder", "DLLM_OFFLOAD_FOLDER", "") or ""),
             attention_implementation=str(
                 pick("attention_implementation", "DLLM_ATTENTION_IMPLEMENTATION", "") or ""

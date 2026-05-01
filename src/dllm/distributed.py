@@ -58,7 +58,6 @@ class DistributedInferenceEngine:
                 offline=settings.offline,
                 trust_remote_code=settings.trust_remote_code,
                 device_map=settings.device_map,
-                max_memory=settings.max_memory,
                 offload_folder=settings.offload_folder,
                 attention_implementation=settings.attention_implementation,
                 language_only=settings.language_only,

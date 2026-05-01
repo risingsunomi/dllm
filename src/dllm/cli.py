@@ -50,11 +50,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Transformers device_map for large/MoE models, e.g. auto, balanced, or a JSON map",
     )
     serve.add_argument(
-        "--max-memory",
-        default=None,
-        help='Transformers max_memory, e.g. "0=20GiB,cpu=80GiB" or JSON',
-    )
-    serve.add_argument(
         "--offload-folder",
         default=None,
         help="folder for CPU/disk offload when using device_map",
