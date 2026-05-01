@@ -99,7 +99,7 @@ python -m dllm.cli serve \
 
 ## OpenAI-Compatible API
 
-The server exposes an OpenAI-compatible chat/completions surface for Hermes Agent, OpenAI SDK clients, and similar frameworks:
+The server exposes an OpenAI-compatible chat/completions surface for [Hermes Agent](https://github.com/nousresearch/hermes-agent), OpenAI SDK clients, and similar frameworks:
 
 - `GET /v1/models`
 - `POST /v1/chat/completions`
@@ -209,7 +209,7 @@ python3 -m dllm.cli serve \
   --no-peer-discovery
 ```
 
-Shard convention follows Cheetah's Python runtime:
+Shard convention:
 
 - `start_layer` is inclusive.
 - `end_layer` is exclusive over transformer blocks.
