@@ -1708,6 +1708,7 @@ def _load_safetensor_shard_weights(
         if target_key in state_keys:
             target_to_source[target_key] = source_key
     _add_tied_output_fallbacks(target_to_source, weight_map, state_keys)
+    _add_mxfp4_expert_fallbacks(target_to_source, weight_map, state_keys)
 
     parameter_keys = set(dict(model.named_parameters()).keys())
     missing_parameters = sorted(key for key in parameter_keys if key not in target_to_source)
@@ -1731,8 +1732,17 @@ def _load_safetensor_shard_weights(
             for target_key, source_key in pairs:
                 if source_key not in keys:
                     continue
-                tensor = handle.get_tensor(source_key)
                 target = state.get(target_key)
+                if _is_mxfp4_blocks_key(source_key):
+                    tensor = _load_mxfp4_projection(
+                        checkpoint_dir,
+                        weight_map,
+                        source_key,
+                        target=target,
+                        torch=torch,
+                    )
+                else:
+                    tensor = handle.get_tensor(source_key)
                 if target is not None:
                     if target.dtype.is_floating_point and tensor.dtype.is_floating_point:
                         tensor = tensor.to(dtype=target.dtype)
@@ -1831,3 +1841,96 @@ def _add_tied_output_fallbacks(
     for target in output_targets:
         if target in state_keys and target not in target_to_source:
             target_to_source[target] = source
+
+
+def _add_mxfp4_expert_fallbacks(
+    target_to_source: dict[str, str],
+    weight_map: dict[str, str],
+    state_keys: set[str],
+) -> None:
+    for target in state_keys:
+        if target in target_to_source:
+            continue
+        if not (
+            target.endswith(".mlp.experts.gate_up_proj")
+            or target.endswith(".mlp.experts.down_proj")
+        ):
+            continue
+        blocks_key = f"{target}_blocks"
+        scales_key = f"{target}_scales"
+        if blocks_key in weight_map and scales_key in weight_map:
+            target_to_source[target] = blocks_key
+
+
+def _is_mxfp4_blocks_key(key: str) -> bool:
+    return key.endswith("_blocks") and (
+        key.endswith(".mlp.experts.gate_up_proj_blocks")
+        or key.endswith(".mlp.experts.down_proj_blocks")
+    )
+
+
+def _load_mxfp4_projection(
+    checkpoint_dir: Path,
+    weight_map: dict[str, str],
+    blocks_key: str,
+    *,
+    target: Any,
+    torch: Any,
+) -> Any:
+    scales_key = f"{blocks_key[: -len('_blocks')]}_scales"
+    if scales_key not in weight_map:
+        raise RuntimeError(f"MXFP4 checkpoint is missing scale tensor for {blocks_key}")
+    blocks = _load_weight_tensor_by_key(checkpoint_dir, weight_map, blocks_key)
+    scales = _load_weight_tensor_by_key(checkpoint_dir, weight_map, scales_key)
+    decoded = _decode_mxfp4_blocks(blocks, scales, torch)
+    if _is_tensor_like(target) and tuple(decoded.shape) != tuple(target.shape):
+        transposed = decoded.transpose(-1, -2).contiguous()
+        if tuple(transposed.shape) == tuple(target.shape):
+            decoded = transposed
+    return decoded
+
+
+def _load_weight_tensor_by_key(checkpoint_dir: Path, weight_map: dict[str, str], key: str) -> Any:
+    try:
+        from safetensors import safe_open
+    except Exception as exc:
+        raise RuntimeError("safetensors is required for MXFP4 expert loading") from exc
+    file_path = checkpoint_dir / str(weight_map[key])
+    with safe_open(str(file_path), framework="pt", device="cpu") as handle:
+        return handle.get_tensor(key)
+
+
+def _decode_mxfp4_blocks(blocks: Any, scales: Any, torch: Any) -> Any:
+    lo = blocks & 0x0F
+    hi = blocks >> 4
+    decoded = torch.empty(
+        (*blocks.shape[:-1], int(blocks.shape[-1]) * 2),
+        dtype=torch.float32,
+        device=blocks.device,
+    )
+    decoded[..., 0::2] = _decode_fp4_nibble(lo, torch)
+    decoded[..., 1::2] = _decode_fp4_nibble(hi, torch)
+    exponents = scales.to(torch.int32) - 127
+    decoded = torch.ldexp(decoded, exponents.unsqueeze(-1))
+    return decoded.reshape(*blocks.shape[:-2], int(blocks.shape[-2]) * int(blocks.shape[-1]) * 2)
+
+
+def _decode_fp4_nibble(values: Any, torch: Any) -> Any:
+    values = values.to(torch.int32)
+    magnitude = values & 0x07
+    sign = torch.where(
+        (values & 0x08) == 0,
+        torch.ones_like(magnitude, dtype=torch.float32),
+        -torch.ones_like(magnitude, dtype=torch.float32),
+    )
+    decoded = torch.where(
+        magnitude == 0,
+        torch.zeros_like(sign),
+        torch.where(
+            magnitude < 5,
+            magnitude.to(torch.float32) * 0.5,
+            magnitude.to(torch.float32) - 2.0,
+        ),
+    )
+    decoded = torch.where(magnitude == 7, torch.full_like(decoded, 6.0), decoded)
+    return decoded * sign
