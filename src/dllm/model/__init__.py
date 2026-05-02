@@ -1683,6 +1683,7 @@ def _load_safetensor_shard_weights(
             target_to_source[target_key] = source_key
     _add_tied_output_fallbacks(target_to_source, weight_map, state_keys)
     _add_mxfp4_expert_fallbacks(target_to_source, weight_map, state_keys)
+    _add_gptq_weight_fallbacks(target_to_source, weight_map, state_keys, key_mapping)
 
     parameter_keys = set(dict(model.named_parameters()).keys())
     missing_parameters = sorted(key for key in parameter_keys if key not in target_to_source)
@@ -1696,6 +1697,7 @@ def _load_safetensor_shard_weights(
         by_file[str(weight_map[source_key])].append((target_key, source_key))
 
     loaded: set[str] = set()
+    quantized_formats: set[str] = set()
     for filename, pairs in sorted(by_file.items()):
         file_path = _resolve_checkpoint_file(checkpoint, filename)
         partial: dict[str, Any] = {}
@@ -1713,6 +1715,25 @@ def _load_safetensor_shard_weights(
                         target=target,
                         torch=torch,
                     )
+                    quantized_formats.add("mxfp4")
+                elif _is_gptq_qweight_key(source_key, weight_map):
+                    tensor = _load_gptq_weight(
+                        checkpoint,
+                        weight_map,
+                        source_key,
+                        target=target,
+                        torch=torch,
+                    )
+                    quantized_formats.add("gptq")
+                elif _is_bnb_4bit_weight_key(source_key, weight_map):
+                    tensor = _load_bnb_4bit_weight(
+                        checkpoint,
+                        weight_map,
+                        source_key,
+                        target=target,
+                        torch=torch,
+                    )
+                    quantized_formats.add("bitsandbytes-4bit")
                 else:
                     tensor = handle.get_tensor(source_key)
                 if target is not None:
@@ -1751,6 +1772,7 @@ def _load_safetensor_shard_weights(
         "loaded_parameters": len(loaded),
         "checkpoint_parameters": len(weight_map),
         "files": sorted(by_file),
+        "quantized_formats": sorted(quantized_formats),
     }
 
 
@@ -1859,6 +1881,23 @@ def _add_mxfp4_expert_fallbacks(
             target_to_source[target] = blocks_key
 
 
+def _add_gptq_weight_fallbacks(
+    target_to_source: dict[str, str],
+    weight_map: dict[str, str],
+    state_keys: set[str],
+    key_mapping: dict[str, str],
+) -> None:
+    for source_key in weight_map:
+        if not _is_gptq_qweight_key(source_key, weight_map):
+            continue
+        mapped_key = _mapped_checkpoint_key(source_key, key_mapping)
+        if not mapped_key.endswith(".qweight"):
+            continue
+        target_key = f"{mapped_key[: -len('.qweight')]}.weight"
+        if target_key in state_keys and target_key not in target_to_source:
+            target_to_source[target_key] = source_key
+
+
 def _is_mxfp4_blocks_key(key: str) -> bool:
     return key.endswith("_blocks") and (
         key.endswith(".mlp.experts.gate_up_proj_blocks")
@@ -1891,10 +1930,204 @@ def _load_weight_tensor_by_key(checkpoint: CheckpointSource, weight_map: dict[st
     try:
         from safetensors import safe_open
     except Exception as exc:
-        raise RuntimeError("safetensors is required for MXFP4 expert loading") from exc
+        raise RuntimeError("safetensors is required for quantized shard loading") from exc
     file_path = _resolve_checkpoint_file(checkpoint, str(weight_map[key]))
     with safe_open(str(file_path), framework="pt", device="cpu") as handle:
         return handle.get_tensor(key)
+
+
+def _is_gptq_qweight_key(key: str, weight_map: dict[str, str]) -> bool:
+    if not key.endswith(".qweight"):
+        return False
+    base = key[: -len(".qweight")]
+    return f"{base}.qzeros" in weight_map and f"{base}.scales" in weight_map
+
+
+def _load_gptq_weight(
+    checkpoint: CheckpointSource,
+    weight_map: dict[str, str],
+    qweight_key: str,
+    *,
+    target: Any,
+    torch: Any,
+) -> Any:
+    base = qweight_key[: -len(".qweight")]
+    qzeros_key = f"{base}.qzeros"
+    scales_key = f"{base}.scales"
+    if qzeros_key not in weight_map or scales_key not in weight_map:
+        raise RuntimeError(f"GPTQ checkpoint is missing qzeros/scales tensor for {qweight_key}")
+
+    qweight = _load_weight_tensor_by_key(checkpoint, weight_map, qweight_key)
+    qzeros = _load_weight_tensor_by_key(checkpoint, weight_map, qzeros_key)
+    scales = _load_weight_tensor_by_key(checkpoint, weight_map, scales_key)
+    g_idx_key = f"{base}.g_idx"
+    g_idx = _load_weight_tensor_by_key(checkpoint, weight_map, g_idx_key) if g_idx_key in weight_map else None
+
+    bits = _infer_gptq_bits(qweight, qzeros, target)
+    if bits is None:
+        target_shape = tuple(getattr(target, "shape", ()))
+        raise RuntimeError(
+            f"could not infer GPTQ bit width for {qweight_key}; "
+            f"qweight={tuple(qweight.shape)}, qzeros={tuple(qzeros.shape)}, target={target_shape}"
+        )
+
+    decoded = _decode_gptq_weight(qweight, qzeros, scales, g_idx, bits, target, torch)
+    return _align_tensor_to_target_shape(decoded, target)
+
+
+def _infer_gptq_bits(qweight: Any, qzeros: Any, target: Any) -> int | None:
+    if not _is_tensor_like(target):
+        return None
+    target_shape = tuple(int(dim) for dim in getattr(target, "shape", ()))
+    if len(target_shape) != 2 or len(getattr(qweight, "shape", ())) != 2 or len(getattr(qzeros, "shape", ())) != 2:
+        return None
+    in_features = target_shape[1]
+    out_features = target_shape[0]
+    qweight_rows = int(qweight.shape[0])
+    qweight_cols = int(qweight.shape[1])
+    qzeros_cols = int(qzeros.shape[1])
+    for bits in (4, 8, 2):
+        pack_factor = 32 // bits
+        if qweight_rows != _ceil_div(in_features, pack_factor):
+            continue
+        if qweight_cols < out_features:
+            continue
+        if qzeros_cols * pack_factor < out_features:
+            continue
+        return bits
+    return None
+
+
+def _decode_gptq_weight(
+    qweight: Any,
+    qzeros: Any,
+    scales: Any,
+    g_idx: Any | None,
+    bits: int,
+    target: Any,
+    torch: Any,
+) -> Any:
+    target_shape = tuple(int(dim) for dim in target.shape)
+    out_features = target_shape[0]
+    in_features = target_shape[1]
+    groups = int(scales.shape[0])
+
+    qvalues = _unpack_gptq_qweight(qweight, bits, torch)[:in_features, :out_features].to(torch.float32)
+    zeros = _unpack_gptq_qzeros(qzeros, bits, torch)[:groups, :out_features].to(torch.float32)
+    scales = scales[:groups, :out_features].to(torch.float32)
+    group_index = _gptq_group_index(g_idx, in_features, groups, torch)
+    decoded = (qvalues - zeros[group_index]) * scales[group_index]
+    return decoded.transpose(0, 1).contiguous()
+
+
+def _unpack_gptq_qweight(qweight: Any, bits: int, torch: Any) -> Any:
+    pack_factor = 32 // bits
+    mask = (1 << bits) - 1
+    shifts = torch.arange(0, bits * pack_factor, bits, device=qweight.device, dtype=torch.int64)
+    packed = qweight.to(torch.int64) & 0xFFFFFFFF
+    unpacked = (packed.unsqueeze(1) >> shifts.view(1, pack_factor, 1)) & mask
+    return unpacked.reshape(int(qweight.shape[0]) * pack_factor, int(qweight.shape[1]))
+
+
+def _unpack_gptq_qzeros(qzeros: Any, bits: int, torch: Any) -> Any:
+    pack_factor = 32 // bits
+    mask = (1 << bits) - 1
+    shifts = torch.arange(0, bits * pack_factor, bits, device=qzeros.device, dtype=torch.int64)
+    packed = qzeros.to(torch.int64) & 0xFFFFFFFF
+    unpacked = (packed.unsqueeze(-1) >> shifts.view(1, 1, pack_factor)) & mask
+    zeros = unpacked.reshape(int(qzeros.shape[0]), int(qzeros.shape[1]) * pack_factor)
+    return zeros + 1
+
+
+def _gptq_group_index(g_idx: Any | None, in_features: int, groups: int, torch: Any) -> Any:
+    if g_idx is not None and int(g_idx.numel()) >= in_features:
+        group_index = g_idx.reshape(-1)[:in_features].to(torch.long)
+    else:
+        group_size = max(_ceil_div(in_features, max(groups, 1)), 1)
+        group_index = torch.arange(in_features, device="cpu", dtype=torch.long) // group_size
+    return group_index.clamp(min=0, max=max(groups - 1, 0))
+
+
+def _is_bnb_4bit_weight_key(key: str, weight_map: dict[str, str]) -> bool:
+    if key not in weight_map:
+        return False
+    prefix = f"{key}."
+    suffixes = {candidate[len(prefix) :] for candidate in weight_map if candidate.startswith(prefix)}
+    return (
+        "quant_state.bitsandbytes__nf4" in suffixes
+        or "quant_state.bitsandbytes__fp4" in suffixes
+        or ("absmax" in suffixes and "quant_map" in suffixes)
+    )
+
+
+def _load_bnb_4bit_weight(
+    checkpoint: CheckpointSource,
+    weight_map: dict[str, str],
+    weight_key: str,
+    *,
+    target: Any,
+    torch: Any,
+) -> Any:
+    try:
+        from bitsandbytes.functional import QuantState, dequantize_4bit
+    except Exception as exc:
+        raise RuntimeError(
+            "bitsandbytes is required for bitsandbytes 4-bit checkpoint shards; "
+            "install it with `pip install -e '.[quantized]'` or `pip install bitsandbytes`"
+        ) from exc
+
+    work_device = _target_tensor_device(target, torch=torch)
+    qweight = _load_weight_tensor_by_key(checkpoint, weight_map, weight_key).contiguous().to(work_device)
+    quant_state_dict: dict[str, Any] = {}
+    prefix = f"{weight_key}."
+    for key in sorted(candidate for candidate in weight_map if candidate.startswith(prefix)):
+        value = _load_weight_tensor_by_key(checkpoint, weight_map, key)
+        if _is_tensor_like(value):
+            value = value.to(work_device)
+        quant_state_dict[key[len(prefix) :]] = value
+
+    try:
+        quant_state = QuantState.from_dict(quant_state_dict, device=work_device)
+        decoded = dequantize_4bit(qweight, quant_state=quant_state)
+    except Exception as exc:
+        raise RuntimeError(f"could not dequantize bitsandbytes 4-bit tensor {weight_key}: {exc}") from exc
+    return _align_tensor_to_target_shape(decoded, target)
+
+
+def _target_tensor_device(target: Any, *, torch: Any) -> Any:
+    if _is_tensor_like(target):
+        device = getattr(target, "device", None)
+        if device is not None and str(device) != "meta":
+            return torch.device(str(device))
+    return torch.device("cpu")
+
+
+def _align_tensor_to_target_shape(tensor: Any, target: Any) -> Any:
+    if not _is_tensor_like(target):
+        return tensor
+    target_shape = tuple(int(dim) for dim in target.shape)
+    if tuple(int(dim) for dim in tensor.shape) == target_shape:
+        return tensor
+    if len(target_shape) == len(tensor.shape) and len(target_shape) >= 2:
+        transposed = tensor.transpose(-1, -2).contiguous()
+        if tuple(int(dim) for dim in transposed.shape) == target_shape:
+            return transposed
+    if int(tensor.numel()) == _shape_numel(target_shape):
+        return tensor.reshape(target_shape).contiguous()
+    raise RuntimeError(
+        f"decoded quantized tensor has shape {tuple(tensor.shape)}, expected {target_shape}"
+    )
+
+
+def _shape_numel(shape: tuple[int, ...]) -> int:
+    total = 1
+    for dim in shape:
+        total *= int(dim)
+    return total
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+    return (int(value) + int(divisor) - 1) // int(divisor)
 
 
 def _decode_mxfp4_blocks(blocks: Any, scales: Any, torch: Any) -> Any:

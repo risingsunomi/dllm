@@ -5,7 +5,7 @@ import unittest
 from dllm.config import Settings, parse_peers
 from dllm import peer as peer_module
 from dllm.distributed import DistributedInferenceEngine
-from dllm.model import GenerationRequest
+from dllm.model import GenerationRequest, _add_gptq_weight_fallbacks, _is_bnb_4bit_weight_key
 from dllm.peer import InferenceWorker
 from dllm.sharding import LayerShard
 
@@ -123,6 +123,50 @@ class _FakeWorkerEngine:
 
 
 class DistributedShardingTests(unittest.TestCase):
+    def test_gptq_weight_fallback_maps_language_prefixed_qweight(self) -> None:
+        target_to_source: dict[str, str] = {}
+        weight_map = {
+            "model.language_model.layers.0.mlp.down_proj.qweight": "model-00001.safetensors",
+            "model.language_model.layers.0.mlp.down_proj.qzeros": "model-00001.safetensors",
+            "model.language_model.layers.0.mlp.down_proj.scales": "model-00001.safetensors",
+        }
+        state_keys = {"model.layers.0.mlp.down_proj.weight"}
+
+        _add_gptq_weight_fallbacks(
+            target_to_source,
+            weight_map,
+            state_keys,
+            {r"^model\.language_model\.": "model."},
+        )
+
+        self.assertEqual(
+            target_to_source["model.layers.0.mlp.down_proj.weight"],
+            "model.language_model.layers.0.mlp.down_proj.qweight",
+        )
+
+    def test_bitsandbytes_4bit_weight_detection_uses_quant_state_metadata(self) -> None:
+        weight_map = {
+            "model.layers.0.self_attn.q_proj.weight": "model-00001.safetensors",
+            "model.layers.0.self_attn.q_proj.weight.absmax": "model-00001.safetensors",
+            "model.layers.0.self_attn.q_proj.weight.nested_absmax": "model-00001.safetensors",
+            "model.layers.0.self_attn.q_proj.weight.nested_quant_map": "model-00001.safetensors",
+            "model.layers.0.self_attn.q_proj.weight.quant_map": "model-00001.safetensors",
+            "model.layers.0.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4": "model-00001.safetensors",
+        }
+
+        self.assertTrue(_is_bnb_4bit_weight_key("model.layers.0.self_attn.q_proj.weight", weight_map))
+        self.assertFalse(_is_bnb_4bit_weight_key("model.layers.0.self_attn.k_proj.weight", weight_map))
+
+    def test_bitsandbytes_4bit_detection_supports_parameter_without_weight_suffix(self) -> None:
+        weight_map = {
+            "model.layers.0.mlp.experts.down_proj": "model-00001.safetensors",
+            "model.layers.0.mlp.experts.down_proj.absmax": "model-00001.safetensors",
+            "model.layers.0.mlp.experts.down_proj.quant_map": "model-00001.safetensors",
+            "model.layers.0.mlp.experts.down_proj.quant_state.bitsandbytes__nf4": "model-00001.safetensors",
+        }
+
+        self.assertTrue(_is_bnb_4bit_weight_key("model.layers.0.mlp.experts.down_proj", weight_map))
+
     def test_ensure_ready_plans_shards_without_loading_weights(self) -> None:
         settings = Settings(
             model_name="demo",

@@ -11,7 +11,7 @@
 
 # dllm
 
-Standalone shard-first distributed inference server using [PyTorch](https://github.com/pytorch/pytorch). Supports MoE, non-MoE, and language-only loading for text use of vision-language repositories.
+Standalone shard-first distributed inference server using [PyTorch](https://github.com/pytorch/pytorch). Supports MoE, non-MoE, quantized safetensor checkpoints, and language-only loading for text use of vision-language repositories.
 
 ## Install
 
@@ -19,6 +19,12 @@ Standalone shard-first distributed inference server using [PyTorch](https://gith
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -e .
+```
+
+For bitsandbytes 4-bit checkpoints, install the optional quantized dependency on each node that may load those shards:
+
+```bash
+pip install -e '.[quantized]'
 ```
 
 If you already have a Python environment with [PyTorch](https://github.com/pytorch/pytorch) and [Transformers](https://github.com/huggingface/transformers) installed, activate it and install this package there:
@@ -112,6 +118,44 @@ python3 -m dllm.cli serve \
 
 On first use, each node resolves the checkpoint index, determines which safetensor files contain its shard's parameters, and downloads only those files. `GET /health` reports MoE metadata when the loaded model config exposes expert fields such as `num_local_experts`, `num_experts`, or `num_experts_per_tok`, and also reports shard-loading details after weights are loaded. Use `--trust-remote-code` only for models that require custom model code.
 
+## Quantized Checkpoints
+
+Shard-native loading supports common safetensor quantized layouts by decoding only the parameters assigned to the local shard.
+
+GPTQ int4 checkpoints such as [Qwen/Qwen3.5-27B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3.5-27B-GPTQ-Int4) store linear weights as `qweight`, `qzeros`, `scales`, and sometimes `g_idx`. `dllm` maps those packed tensors back to the full parameter name for the assigned shard, including language-only prefixes such as `model.language_model.`, then dequantizes that shard's tensor before loading it into the model.
+
+bitsandbytes 4-bit checkpoints such as [unsloth/gpt-oss-20b-unsloth-bnb-4bit](https://huggingface.co/unsloth/gpt-oss-20b-unsloth-bnb-4bit) store packed `weight` tensors with sidecar metadata like `weight.absmax`, `weight.quant_map`, `weight.nested_quant_map`, and `weight.quant_state.bitsandbytes__nf4`. Install `.[quantized]` on worker nodes that may receive those layers so `dllm` can reconstruct the assigned tensor through bitsandbytes before loading it.
+
+Examples:
+
+```bash
+python3 -m dllm.cli serve \
+  --role server \
+  --model-name Qwen/Qwen3.5-27B-GPTQ-Int4 \
+  --node-name node-a \
+  --device auto \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --peers node-b@192.168.0.5:8765 \
+  --no-peer-discovery \
+  --trust-remote-code
+```
+
+```bash
+python3 -m dllm.cli serve \
+  --role server \
+  --model-name unsloth/gpt-oss-20b-unsloth-bnb-4bit \
+  --node-name node-a \
+  --device auto \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --peers node-b@192.168.0.5:8765 \
+  --no-peer-discovery \
+  --request-timeout 3600
+```
+
+Quantized support is a compatibility path for shard-native loading. It avoids loading the full checkpoint on every node, but the assigned packed tensors are dequantized into the runtime parameter dtype for compute.
+
 ## Vision-Language Repos As Language Models
 
 Some current image/video-text repos package a vision tower and a language model in one checkpoint. `dllm` defaults to language-only loading when a repo exposes a nested language config such as `text_config`, `language_config`, or `llm_config`. This avoids loading the vision tower for text-only serving.
@@ -202,6 +246,41 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
     }]
   }'
 ```
+
+For use with [OpenClaw](https://docs.openclaw.ai/gateway/local-models#other-openai-compatible-local-proxies), configure `dllm` as an OpenAI-compatible local proxy:
+
+```js
+{
+  agents: {
+    defaults: {
+      model: { primary: "dllm/Qwen/Qwen2.5-0.5B-Instruct" },
+    },
+  },
+  models: {
+    mode: "merge",
+    providers: {
+      dllm: {
+        baseUrl: "http://127.0.0.1:8000/v1",
+        apiKey: "sk-local",
+        api: "openai-completions",
+        models: [
+          {
+            id: "Qwen/Qwen2.5-0.5B-Instruct",
+            name: "Qwen/Qwen2.5-0.5B-Instruct",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 32768,
+            maxTokens: 8192,
+          },
+        ],
+      },
+    },
+  },
+}
+```
+
+Use `api: "openai-completions"` because `dllm` exposes `/v1/chat/completions` and `/v1/completions`.
 
 For use with [Hermes Agent](https://github.com/nousresearch/hermes-agent) choose the custom endpoint provider or add a config like:
 
