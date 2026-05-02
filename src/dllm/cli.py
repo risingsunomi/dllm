@@ -118,7 +118,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="optional context length advertised from /v1/models",
     )
-    serve.add_argument("--request-timeout", type=float, default=None)
+    serve.add_argument(
+        "--request-timeout",
+        type=float,
+        default=None,
+        help="seconds to wait for peer load/forward requests; large first-time checkpoint loads may need 3600+",
+    )
     serve.add_argument("--peer-connect-timeout", type=float, default=None)
     serve.add_argument(
         "--preload",

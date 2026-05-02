@@ -138,6 +138,7 @@ python3 -m dllm.cli serve \
   --port 8000 \
   --peers node-b@192.168.0.5:8765 \
   --no-peer-discovery \
+  --request-timeout 3600 \
   --trust-remote-code
 ```
 

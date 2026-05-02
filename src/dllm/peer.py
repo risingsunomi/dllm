@@ -29,7 +29,7 @@ class PeerProtocolError(RuntimeError):
 
 
 class PeerClient:
-    def __init__(self, *, timeout: float = 300.0, connect_timeout: float = 5.0) -> None:
+    def __init__(self, *, timeout: float = 3600.0, connect_timeout: float = 5.0) -> None:
         self.timeout = timeout
         self.connect_timeout = connect_timeout
 
@@ -104,11 +104,18 @@ class PeerClient:
             raise PeerProtocolError("request is too large")
 
         socket_timeout = self.timeout if timeout is None else timeout
-        with socket.create_connection((host, int(port)), timeout=self.connect_timeout) as sock:
-            sock.settimeout(socket_timeout)
-            sock.sendall(_HEADER.pack(len(body)))
-            sock.sendall(body)
-            response = _read_message(sock)
+        command = str(message.get("command", "request"))
+        try:
+            with socket.create_connection((host, int(port)), timeout=self.connect_timeout) as sock:
+                sock.settimeout(socket_timeout)
+                sock.sendall(_HEADER.pack(len(body)))
+                sock.sendall(body)
+                response = _read_message(sock)
+        except socket.timeout as exc:
+            raise TimeoutError(
+                f"peer {command} timed out after {socket_timeout:g}s; "
+                "increase --request-timeout/DLLM_REQUEST_TIMEOUT for first loads of large checkpoints"
+            ) from exc
 
         decoded = json.loads(response.decode("utf-8"))
         if not isinstance(decoded, dict):
@@ -306,7 +313,10 @@ class InferenceWorker:
                     response = worker.dispatch(message)
                 except Exception as exc:
                     response = {"ok": False, "error": str(exc)}
-                _write_message(self.request, json.dumps(response, separators=(",", ":")).encode("utf-8"))
+                try:
+                    _write_message(self.request, json.dumps(response, separators=(",", ":")).encode("utf-8"))
+                except (BrokenPipeError, ConnectionResetError):
+                    return
 
         server = _ThreadingTCPServer((self.settings.peer_host, self.settings.peer_port), Handler)
         server.worker = self  # type: ignore[attr-defined]

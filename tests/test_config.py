@@ -59,6 +59,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.language_weight_prefix, "model.language_model.")
         self.assertEqual(settings.weight_key_mapping, r"^layers\.=model.layers.")
 
+    def test_large_model_request_timeout_default(self) -> None:
+        settings = Settings.from_mapping({"model_name": "demo"})
+        self.assertEqual(settings.request_timeout, 3600.0)
+
     def test_server_requires_local_first_shard(self) -> None:
         settings = Settings.from_mapping(
             {

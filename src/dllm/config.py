@@ -55,7 +55,7 @@ class Settings:
     top_k: int = 0
     repetition_penalty: float = 1.0
     context_length: int = 0
-    request_timeout: float = 300.0
+    request_timeout: float = 3600.0
     peer_connect_timeout: float = 5.0
     env_file: str = ".env"
 
@@ -112,7 +112,7 @@ class Settings:
                 1.0,
             ),
             context_length=_int(pick("context_length", "DLLM_CONTEXT_LENGTH", 0), 0),
-            request_timeout=_float(pick("request_timeout", "DLLM_REQUEST_TIMEOUT", 300.0), 300.0),
+            request_timeout=_float(pick("request_timeout", "DLLM_REQUEST_TIMEOUT", 3600.0), 3600.0),
             peer_connect_timeout=_float(
                 pick("peer_connect_timeout", "DLLM_PEER_CONNECT_TIMEOUT", 5.0),
                 5.0,
