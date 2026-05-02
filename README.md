@@ -124,7 +124,7 @@ Shard-native loading supports common safetensor quantized layouts by decoding on
 
 GPTQ int4 checkpoints such as [Qwen/Qwen3.5-27B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3.5-27B-GPTQ-Int4) store linear weights as `qweight`, `qzeros`, `scales`, and sometimes `g_idx`. `dllm` maps those packed tensors back to the full parameter name for the assigned shard, including language-only prefixes such as `model.language_model.`, then dequantizes that shard's tensor before loading it into the model.
 
-bitsandbytes 4-bit checkpoints such as [unsloth/gpt-oss-20b-unsloth-bnb-4bit](https://huggingface.co/unsloth/gpt-oss-20b-unsloth-bnb-4bit) store packed `weight` tensors with sidecar metadata like `weight.absmax`, `weight.quant_map`, `weight.nested_quant_map`, and `weight.quant_state.bitsandbytes__nf4`. Install `.[quantized]` on worker nodes that may receive those layers so `dllm` can reconstruct the assigned tensor through bitsandbytes before loading it.
+bitsandbytes 4-bit checkpoints such as [unsloth/gpt-oss-20b-unsloth-bnb-4bit](https://huggingface.co/unsloth/gpt-oss-20b-unsloth-bnb-4bit) store packed `weight` tensors with sidecar metadata like `weight.absmax`, `weight.quant_map`, `weight.nested_quant_map`, and `weight.quant_state.bitsandbytes__nf4`. [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) is installed by default to be used to load these weights into a tensor.
 
 Examples:
 
@@ -247,7 +247,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-For use with [OpenClaw](https://docs.openclaw.ai/gateway/local-models#other-openai-compatible-local-proxies), configure `dllm` as an OpenAI-compatible local proxy:
+For use with [OpenClaw](https://github.com/openclaw/openclaw), configure `dllm` as an OpenAI-compatible local proxy:
 
 ```js
 {
