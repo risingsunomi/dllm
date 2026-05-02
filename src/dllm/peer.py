@@ -90,6 +90,14 @@ class PeerClient:
     def forward_shard(self, host: str, port: int, payload: dict[str, Any]) -> dict[str, Any]:
         return self.send(host, port, {"command": "forward_shard", "payload": payload}, timeout=self.timeout)
 
+    def unload_model(self, host: str, port: int, *, reason: str = "generation_done") -> dict[str, Any]:
+        return self.send(
+            host,
+            port,
+            {"command": "unload_model", "payload": {"reason": reason}},
+            timeout=self.timeout,
+        )
+
     def send(self, host: str, port: int, message: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
         body = json.dumps(message, separators=(",", ":")).encode("utf-8")
         if len(body) > _MAX_MESSAGE_BYTES:
@@ -171,6 +179,8 @@ class InferenceWorker:
             return self._handle_load_model(payload)
         if command == "forward_shard":
             return self._handle_forward_shard(payload)
+        if command == "unload_model":
+            return self._handle_unload_model(payload)
         if command == "shutdown":
             threading.Thread(target=self.stop, daemon=True).start()
             return {"ok": True, "payload": {"stopping": True}}
@@ -261,6 +271,24 @@ class InferenceWorker:
             "ok": True,
             "payload": {
                 **result,
+                "node_name": self.settings.node_name,
+            },
+        }
+
+    def _handle_unload_model(self, payload: dict[str, Any]) -> dict[str, Any]:
+        reason = str(payload.get("reason") or "generation_done")
+        with self._engine_lock:
+            start = time.perf_counter()
+            self.engine.unload()
+            elapsed = time.perf_counter() - start
+            engine_health = self.engine.health()
+        return {
+            "ok": True,
+            "payload": {
+                "unloaded": True,
+                "reason": reason,
+                "elapsed_seconds": elapsed,
+                "engine": engine_health,
                 "node_name": self.settings.node_name,
             },
         }

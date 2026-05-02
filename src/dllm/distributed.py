@@ -292,58 +292,61 @@ class DistributedInferenceEngine:
         stop_filter = _ShardStopFilter(request.stop)
         start = time.perf_counter()
 
-        for _ in range(max(int(request.max_new_tokens), 1)):
-            stage_payload: dict[str, Any] = {
-                **request_payload,
-                "input_ids": encoded_inputs["input_ids"],
-                "attention_mask": encoded_inputs["attention_mask"],
-                "position_ids": encoded_inputs["position_ids"],
-                "seen_tokens": seen_tokens,
-            }
-            result = self.local_engine.forward_shard(stage_payload)
-            for peer in self._shard_peers():
-                result = self._forward_peer_shard(peer, {**stage_payload, **_next_shard_payload(result)})
+        try:
+            for _ in range(max(int(request.max_new_tokens), 1)):
+                stage_payload: dict[str, Any] = {
+                    **request_payload,
+                    "input_ids": encoded_inputs["input_ids"],
+                    "attention_mask": encoded_inputs["attention_mask"],
+                    "position_ids": encoded_inputs["position_ids"],
+                    "seen_tokens": seen_tokens,
+                }
+                result = self.local_engine.forward_shard(stage_payload)
+                for peer in self._shard_peers():
+                    result = self._forward_peer_shard(peer, {**stage_payload, **_next_shard_payload(result)})
 
-            if "token_id" not in result:
-                raise RuntimeError("sharded inference ended without a final token")
+                if "token_id" not in result:
+                    raise RuntimeError("sharded inference ended without a final token")
 
-            token_id = int(result["token_id"])
-            token_ids.append(token_id)
-            seen_tokens.append(token_id)
-            piece = self.local_engine.decode_token_ids([token_id])
-            filtered = stop_filter.push(piece)
-            if filtered:
-                text_parts.append(filtered)
+                token_id = int(result["token_id"])
+                token_ids.append(token_id)
+                seen_tokens.append(token_id)
+                piece = self.local_engine.decode_token_ids([token_id])
+                filtered = stop_filter.push(piece)
+                if filtered:
+                    text_parts.append(filtered)
+                    if emit_tokens:
+                        yield {"event": "token", "text": filtered}
+
+                if bool(result.get("end_token")) or stop_filter.stopped:
+                    break
+                encoded_inputs = self.local_engine.append_token_to_inputs(encoded_inputs, token_id)
+
+            trailing = stop_filter.finish()
+            if trailing:
+                text_parts.append(trailing)
                 if emit_tokens:
-                    yield {"event": "token", "text": filtered}
+                    yield {"event": "token", "text": trailing}
 
-            if bool(result.get("end_token")) or stop_filter.stopped:
-                break
-            encoded_inputs = self.local_engine.append_token_to_inputs(encoded_inputs, token_id)
-
-        trailing = stop_filter.finish()
-        if trailing:
-            text_parts.append(trailing)
-            if emit_tokens:
-                yield {"event": "token", "text": trailing}
-
-        elapsed = time.perf_counter() - start
-        done = {
-            "event": "done",
-            "text": "".join(text_parts),
-            "generated_tokens": len(token_ids),
-            "prompt_tokens": prompt_tokens,
-            "elapsed_seconds": elapsed,
-            "tokens_per_second": (len(token_ids) / elapsed) if elapsed > 0 else 0.0,
-            "model_name": self.settings.model_name,
-            "device": self.settings.device,
-            "node_name": self.settings.node_name,
-            "target": "sharded",
-            "distributed": True,
-            "shards": self._shard_summary(),
-        }
-        _log_tokens_per_second(done)
-        yield done
+            elapsed = time.perf_counter() - start
+            done = {
+                "event": "done",
+                "text": "".join(text_parts),
+                "generated_tokens": len(token_ids),
+                "prompt_tokens": prompt_tokens,
+                "elapsed_seconds": elapsed,
+                "tokens_per_second": (len(token_ids) / elapsed) if elapsed > 0 else 0.0,
+                "model_name": self.settings.model_name,
+                "device": self.settings.device,
+                "node_name": self.settings.node_name,
+                "target": "sharded",
+                "distributed": True,
+                "shards": self._shard_summary(),
+            }
+            _log_tokens_per_second(done)
+            yield done
+        finally:
+            self._release_peer_shards()
 
     def _forward_peer_shard(self, peer: PeerState, payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -357,6 +360,25 @@ class DistributedInferenceEngine:
             peer.healthy = False
             peer.last_error = str(exc)
             raise
+
+    def _release_peer_shards(self) -> None:
+        released_any = False
+        for peer in self.peers:
+            if peer.shard is None:
+                continue
+            released_any = True
+            try:
+                self.peer_client.unload_model(peer.spec.host, peer.spec.port, reason="generation_done")
+                peer.healthy = True
+                peer.loaded = False
+                peer.last_error = ""
+                peer.last_seen = time.time()
+            except Exception as exc:
+                peer.healthy = False
+                peer.loaded = False
+                peer.last_error = f"unload failed: {exc}"
+        if released_any:
+            self._ready = False
 
     def _shard_summary(self) -> list[dict[str, Any]]:
         summary: list[dict[str, Any]] = []

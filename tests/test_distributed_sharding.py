@@ -54,6 +54,7 @@ class _FakePeerClient:
     def __init__(self) -> None:
         self.payloads: list[dict] = []
         self.load_payloads: list[dict] = []
+        self.unload_payloads: list[dict] = []
 
     def load_model(self, host: str, port: int, **payload) -> dict:
         self.load_payloads.append({"host": host, "port": port, "payload": payload})
@@ -62,6 +63,10 @@ class _FakePeerClient:
     def forward_shard(self, host: str, port: int, payload: dict) -> dict:
         self.payloads.append({"host": host, "port": port, "payload": payload})
         return {"payload": {"token_id": 65, "end_token": True}}
+
+    def unload_model(self, host: str, port: int, *, reason: str = "generation_done") -> dict:
+        self.unload_payloads.append({"host": host, "port": port, "reason": reason})
+        return {"payload": {"unloaded": True, "engine": {"loaded": False}}}
 
 
 class _PlanningEngine(DistributedInferenceEngine):
@@ -156,6 +161,22 @@ class DistributedShardingTests(unittest.TestCase):
         finally:
             peer_module.TorchTransformersEngine = original_engine  # type: ignore[assignment]
 
+    def test_worker_unload_model_releases_weights(self) -> None:
+        original_engine = peer_module.TorchTransformersEngine
+        peer_module.TorchTransformersEngine = _FakeWorkerEngine  # type: ignore[assignment]
+        try:
+            settings = Settings(model_name="demo", node_name="node-b", role="worker")
+            worker = InferenceWorker(settings)
+            worker.engine.load()
+
+            response = worker._handle_unload_model({"reason": "generation_done"})
+
+            self.assertTrue(response["payload"]["unloaded"])
+            self.assertFalse(response["payload"]["engine"]["loaded"])
+            self.assertEqual(worker.engine.unload_calls, 1)
+        finally:
+            peer_module.TorchTransformersEngine = original_engine  # type: ignore[assignment]
+
     def test_sharded_generation_passes_hidden_state_to_peer(self) -> None:
         settings = Settings(
             model_name="demo",
@@ -176,6 +197,8 @@ class DistributedShardingTests(unittest.TestCase):
         self.assertEqual(result["text"], "A")
         self.assertEqual(result["target"], "sharded")
         self.assertIn("hidden_state", peer_client.payloads[0]["payload"])
+        self.assertEqual(len(peer_client.unload_payloads), 1)
+        self.assertFalse(engine.peers[0].loaded)
         self.assertEqual(result["shards"][0]["shard"]["start_layer"], 0)
         self.assertTrue(result["shards"][1]["shard"]["is_final"])
 
