@@ -1196,7 +1196,9 @@ def _language_loading_plan(
             },
         }
 
-    language_config = transformers.AutoConfig.for_model(text_model_type, **text_config_dict)
+    language_config_kwargs = dict(text_config_dict)
+    language_config_kwargs.pop("model_type", None)
+    language_config = transformers.AutoConfig.for_model(text_model_type, **language_config_kwargs)
     prefixes = _language_weight_prefixes(
         model_name,
         explicit_prefix=language_weight_prefix,

@@ -7,6 +7,7 @@ from dllm.model import (
     _auto_weight_key_mapping,
     _cast_floating_tensor,
     _key_mapping_for_prefixes,
+    _language_loading_plan,
     _last_hidden_state,
     _moe_metadata,
     _nested_language_config_dict,
@@ -94,6 +95,34 @@ class ModelLoadingOptionsTests(unittest.TestCase):
             "vision_config": {"hidden_size": 512},
         }
         self.assertEqual(_nested_language_config_dict(config)["model_type"], "qwen_text")
+
+    def test_language_loading_plan_drops_duplicate_model_type_kwarg(self) -> None:
+        class FakeAutoConfig:
+            @staticmethod
+            def for_model(model_type, **kwargs):
+                return {"model_type": model_type, **kwargs}
+
+        class FakeTransformers:
+            AutoConfig = FakeAutoConfig
+
+        config = {
+            "model_type": "vision_language",
+            "text_config": {"model_type": "qwen_text", "hidden_size": 1024},
+            "vision_config": {"hidden_size": 512},
+        }
+
+        plan = _language_loading_plan(
+            FakeTransformers,
+            "demo",
+            config,
+            language_only=True,
+            language_weight_prefix="model.language_model.",
+            offline=True,
+            trust_remote_code=False,
+        )
+
+        self.assertEqual(plan["config"], {"model_type": "qwen_text", "hidden_size": 1024})
+        self.assertTrue(plan["metadata"]["active"])
 
     def test_language_prefix_key_mapping(self) -> None:
         mapping = _key_mapping_for_prefixes(["model.language_model."])
