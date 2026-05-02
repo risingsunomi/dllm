@@ -5,7 +5,12 @@ import unittest
 from dllm.config import Settings, parse_peers
 from dllm import peer as peer_module
 from dllm.distributed import DistributedInferenceEngine
-from dllm.model import GenerationRequest, _add_gptq_weight_fallbacks, _is_bnb_4bit_weight_key
+from dllm.model import (
+    GenerationRequest,
+    _add_gptq_weight_fallbacks,
+    _add_split_bnb_expert_fallbacks,
+    _is_bnb_4bit_weight_key,
+)
 from dllm.peer import InferenceWorker
 from dllm.sharding import LayerShard
 
@@ -166,6 +171,58 @@ class DistributedShardingTests(unittest.TestCase):
         }
 
         self.assertTrue(_is_bnb_4bit_weight_key("model.layers.0.mlp.experts.down_proj", weight_map))
+
+    def test_split_bitsandbytes_expert_fallback_maps_unsloth_gpt_oss_layout(self) -> None:
+        target_to_source: dict[str, str] = {}
+        state_keys = {
+            "model.layers.0.mlp.experts.down_proj",
+            "model.layers.0.mlp.experts.down_proj_bias",
+            "model.layers.0.mlp.experts.gate_up_proj",
+            "model.layers.0.mlp.experts.gate_up_proj_bias",
+            "model.layers.0.mlp.router.weight",
+            "model.layers.0.mlp.router.bias",
+        }
+        weight_map = {
+            "model.layers.0.mlp.experts.down_projs.0.weight": "model-00001.safetensors",
+            "model.layers.0.mlp.experts.down_projs.0.weight.absmax": "model-00001.safetensors",
+            "model.layers.0.mlp.experts.down_projs.0.weight.quant_map": "model-00001.safetensors",
+            "model.layers.0.mlp.experts.down_projs.0.weight.quant_state.bitsandbytes__nf4": "model-00001.safetensors",
+            "model.layers.0.mlp.experts.down_projs.0.bias": "model-00001.safetensors",
+            "model.layers.0.mlp.experts.gate_up_projs.0.weight": "model-00001.safetensors",
+            "model.layers.0.mlp.experts.gate_up_projs.0.weight.absmax": "model-00001.safetensors",
+            "model.layers.0.mlp.experts.gate_up_projs.0.weight.quant_map": "model-00001.safetensors",
+            "model.layers.0.mlp.experts.gate_up_projs.0.weight.quant_state.bitsandbytes__nf4": "model-00001.safetensors",
+            "model.layers.0.mlp.experts.gate_up_projs.0.bias": "model-00001.safetensors",
+            "model.layers.0.mlp.router.linear.weight": "model-00001.safetensors",
+            "model.layers.0.mlp.router.linear.bias": "model-00001.safetensors",
+        }
+
+        _add_split_bnb_expert_fallbacks(target_to_source, weight_map, state_keys)
+
+        self.assertEqual(
+            target_to_source["model.layers.0.mlp.experts.down_proj"],
+            "model.layers.0.mlp.experts.down_projs.0.weight",
+        )
+        self.assertEqual(
+            target_to_source["model.layers.0.mlp.experts.down_proj_bias"],
+            "model.layers.0.mlp.experts.down_projs.0.bias",
+        )
+        self.assertEqual(
+            target_to_source["model.layers.0.mlp.experts.gate_up_proj"],
+            "model.layers.0.mlp.experts.gate_up_projs.0.weight",
+        )
+        self.assertEqual(
+            target_to_source["model.layers.0.mlp.experts.gate_up_proj_bias"],
+            "model.layers.0.mlp.experts.gate_up_projs.0.bias",
+        )
+        self.assertEqual(
+            target_to_source["model.layers.0.mlp.router.weight"],
+            "model.layers.0.mlp.router.linear.weight",
+        )
+        self.assertEqual(
+            target_to_source["model.layers.0.mlp.router.bias"],
+            "model.layers.0.mlp.router.linear.bias",
+        )
 
     def test_ensure_ready_plans_shards_without_loading_weights(self) -> None:
         settings = Settings(

@@ -124,7 +124,7 @@ Shard-native loading supports common safetensor quantized layouts by decoding on
 
 GPTQ int4 checkpoints such as [Qwen/Qwen3.5-27B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3.5-27B-GPTQ-Int4) store linear weights as `qweight`, `qzeros`, `scales`, and sometimes `g_idx`. `dllm` maps those packed tensors back to the full parameter name for the assigned shard, including language-only prefixes such as `model.language_model.`, then dequantizes that shard's tensor before loading it into the model.
 
-bitsandbytes 4-bit checkpoints such as [unsloth/gpt-oss-20b-unsloth-bnb-4bit](https://huggingface.co/unsloth/gpt-oss-20b-unsloth-bnb-4bit) store packed `weight` tensors with sidecar metadata like `weight.absmax`, `weight.quant_map`, `weight.nested_quant_map`, and `weight.quant_state.bitsandbytes__nf4`. [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) is installed by default to be used to load these weights into a tensor.
+bitsandbytes 4-bit checkpoints such as [unsloth/gpt-oss-20b-unsloth-bnb-4bit](https://huggingface.co/unsloth/gpt-oss-20b-unsloth-bnb-4bit) store packed `weight` tensors with sidecar metadata like `weight.absmax`, `weight.quant_map`, `weight.nested_quant_map`, and `weight.quant_state.bitsandbytes__nf4`. For GPT-OSS MoE variants that split experts into keys such as `experts.down_projs.0.weight`, `dllm` reassembles those per-expert tensors into the fused `experts.down_proj` and `experts.gate_up_proj` parameters expected by the model. [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) is installed by default to be used to load these weights into a tensor.
 
 Examples:
 

@@ -1686,6 +1686,7 @@ def _load_safetensor_shard_weights(
     _add_tied_output_fallbacks(target_to_source, weight_map, state_keys)
     _add_mxfp4_expert_fallbacks(target_to_source, weight_map, state_keys)
     _add_gptq_weight_fallbacks(target_to_source, weight_map, state_keys, key_mapping)
+    _add_split_bnb_expert_fallbacks(target_to_source, weight_map, state_keys)
 
     parameter_keys = set(dict(model.named_parameters()).keys())
     missing_parameters = sorted(key for key in parameter_keys if key not in target_to_source)
@@ -1727,6 +1728,15 @@ def _load_safetensor_shard_weights(
                         torch=torch,
                     )
                     quantized_formats.add("gptq")
+                elif _is_split_bnb_expert_source_key(source_key):
+                    tensor = _load_split_bnb_expert_tensor(
+                        checkpoint,
+                        weight_map,
+                        source_key,
+                        target=target,
+                        torch=torch,
+                    )
+                    quantized_formats.add("bitsandbytes-4bit")
                 elif _is_bnb_4bit_weight_key(source_key, weight_map):
                     tensor = _load_bnb_4bit_weight(
                         checkpoint,
@@ -1900,6 +1910,43 @@ def _add_gptq_weight_fallbacks(
             target_to_source[target_key] = source_key
 
 
+def _add_split_bnb_expert_fallbacks(
+    target_to_source: dict[str, str],
+    weight_map: dict[str, str],
+    state_keys: set[str],
+) -> None:
+    suffixes = {
+        ".mlp.experts.down_proj": (".mlp.experts.down_projs.", "weight"),
+        ".mlp.experts.down_proj_bias": (".mlp.experts.down_projs.", "bias"),
+        ".mlp.experts.gate_up_proj": (".mlp.experts.gate_up_projs.", "weight"),
+        ".mlp.experts.gate_up_proj_bias": (".mlp.experts.gate_up_projs.", "bias"),
+    }
+    router_suffixes = {
+        ".mlp.router.weight": ".mlp.router.linear.weight",
+        ".mlp.router.bias": ".mlp.router.linear.bias",
+    }
+    for target in state_keys:
+        if target in target_to_source:
+            continue
+        for target_suffix, (source_middle, leaf) in suffixes.items():
+            if not target.endswith(target_suffix):
+                continue
+            source_prefix = target[: -len(target_suffix)] + source_middle
+            source_key = f"{source_prefix}0.{leaf}"
+            if source_key in weight_map:
+                target_to_source[target] = source_key
+            break
+        if target in target_to_source:
+            continue
+        for target_suffix, source_suffix in router_suffixes.items():
+            if not target.endswith(target_suffix):
+                continue
+            source_key = target[: -len(target_suffix)] + source_suffix
+            if source_key in weight_map:
+                target_to_source[target] = source_key
+            break
+
+
 def _is_mxfp4_blocks_key(key: str) -> bool:
     return key.endswith("_blocks") and (
         key.endswith(".mlp.experts.gate_up_proj_blocks")
@@ -2062,6 +2109,69 @@ def _is_bnb_4bit_weight_key(key: str, weight_map: dict[str, str]) -> bool:
     )
 
 
+def _is_split_bnb_expert_source_key(key: str) -> bool:
+    return _split_bnb_expert_parts(key) is not None
+
+
+def _split_bnb_expert_parts(key: str) -> tuple[str, str, str] | None:
+    match = re.match(
+        r"^(?P<prefix>.+\.mlp\.experts\.)(?P<projection>down_projs|gate_up_projs)\.0\.(?P<leaf>weight|bias)$",
+        key,
+    )
+    if match is None:
+        return None
+    return match.group("prefix"), match.group("projection"), match.group("leaf")
+
+
+def _load_split_bnb_expert_tensor(
+    checkpoint: CheckpointSource,
+    weight_map: dict[str, str],
+    source_key: str,
+    *,
+    target: Any,
+    torch: Any,
+) -> Any:
+    parts = _split_bnb_expert_parts(source_key)
+    if parts is None:
+        raise RuntimeError(f"invalid split bitsandbytes expert source key: {source_key}")
+    prefix, projection, leaf = parts
+    pattern = re.compile(rf"^{re.escape(prefix + projection)}\.(\d+)\.{re.escape(leaf)}$")
+    expert_keys: list[tuple[int, str]] = []
+    for key in weight_map:
+        match = pattern.match(key)
+        if match is not None:
+            expert_keys.append((int(match.group(1)), key))
+    if not expert_keys:
+        raise RuntimeError(f"bitsandbytes split expert checkpoint is missing tensors for {source_key}")
+
+    expert_keys.sort(key=lambda item: item[0])
+    if _is_tensor_like(target) and len(getattr(target, "shape", ())) > 0:
+        expected_experts = int(target.shape[0])
+        if len(expert_keys) < expected_experts:
+            raise RuntimeError(
+                f"bitsandbytes split expert checkpoint has {len(expert_keys)} experts for "
+                f"{source_key}, expected {expected_experts}"
+            )
+        expert_keys = expert_keys[:expected_experts]
+
+    tensors: list[Any] = []
+    for _, key in expert_keys:
+        if leaf == "weight" and _is_bnb_4bit_weight_key(key, weight_map):
+            tensor = _load_bnb_4bit_weight(
+                checkpoint,
+                weight_map,
+                key,
+                target=target,
+                torch=torch,
+                align=False,
+            )
+        else:
+            tensor = _load_weight_tensor_by_key(checkpoint, weight_map, key)
+        tensors.append(tensor)
+    stacked = torch.stack(tensors, dim=0)
+    return _align_tensor_to_target_shape(stacked, target)
+
+
 def _load_bnb_4bit_weight(
     checkpoint: CheckpointSource,
     weight_map: dict[str, str],
@@ -2069,6 +2179,7 @@ def _load_bnb_4bit_weight(
     *,
     target: Any,
     torch: Any,
+    align: bool = True,
 ) -> Any:
     try:
         from bitsandbytes.functional import QuantState, dequantize_4bit
@@ -2093,6 +2204,8 @@ def _load_bnb_4bit_weight(
         decoded = dequantize_4bit(qweight, quant_state=quant_state)
     except Exception as exc:
         raise RuntimeError(f"could not dequantize bitsandbytes 4-bit tensor {weight_key}: {exc}") from exc
+    if not align:
+        return decoded
     return _align_tensor_to_target_shape(decoded, target)
 
 
