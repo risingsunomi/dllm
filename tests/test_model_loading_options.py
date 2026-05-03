@@ -8,6 +8,7 @@ from dllm.model import (
     _cast_floating_tensor,
     _key_mapping_for_prefixes,
     _language_loading_plan,
+    _language_weight_prefixes,
     _last_hidden_state,
     _moe_metadata,
     _nested_language_config_dict,
@@ -129,6 +130,36 @@ class ModelLoadingOptionsTests(unittest.TestCase):
     def test_language_prefix_key_mapping(self) -> None:
         mapping = _key_mapping_for_prefixes(["model.language_model."])
         self.assertEqual(mapping[r"^model\.language_model\."], "model.")
+
+    def test_language_prefix_detects_nested_language_model_model_layout(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir)
+            (path / "model.safetensors.index.json").write_text(
+                (
+                    '{"weight_map":{'
+                    '"language_model.model.embed_tokens.weight":"model-00001.safetensors",'
+                    '"language_model.model.layers.0.mlp.down_proj.weight":"model-00001.safetensors"'
+                    "}}"
+                ),
+                encoding="utf-8",
+            )
+
+            prefixes = _language_weight_prefixes(
+                str(path),
+                explicit_prefix="auto",
+                offline=True,
+                trust_remote_code=False,
+            )
+
+        self.assertEqual(prefixes[:2], ["language_model.model.", "language_model."])
+        mapping = _key_mapping_for_prefixes(prefixes)
+        self.assertEqual(
+            mapping[r"^language_model\.model\."],
+            "model.",
+        )
 
     def test_parse_weight_key_mapping(self) -> None:
         mapping = _parse_weight_key_mapping(

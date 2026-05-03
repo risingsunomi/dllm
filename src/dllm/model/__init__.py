@@ -1254,10 +1254,16 @@ def _language_weight_prefixes(
         trust_remote_code=trust_remote_code,
     )
     candidates = (
+        "model.language_model.model.",
+        "language_model.model.",
         "model.language_model.",
         "language_model.",
+        "model.text_model.model.",
+        "text_model.model.",
         "model.text_model.",
         "text_model.",
+        "model.llm.model.",
+        "llm.model.",
         "model.llm.",
         "llm.",
     )
