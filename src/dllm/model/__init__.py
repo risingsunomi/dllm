@@ -1708,7 +1708,7 @@ def _load_safetensor_shard_weights(
         target_key = _mapped_checkpoint_key(source_key, key_mapping)
         if target_key in state_keys:
             target_to_source[target_key] = source_key
-    _add_tied_output_fallbacks(target_to_source, weight_map, state_keys)
+    _add_tied_output_fallbacks(target_to_source, weight_map, state_keys, key_mapping)
     _add_mxfp4_expert_fallbacks(target_to_source, weight_map, state_keys)
     _add_gptq_weight_fallbacks(target_to_source, weight_map, state_keys, key_mapping)
     _add_split_bnb_expert_fallbacks(target_to_source, weight_map, state_keys)
@@ -1883,8 +1883,9 @@ def _add_tied_output_fallbacks(
     target_to_source: dict[str, str],
     weight_map: dict[str, str],
     state_keys: set[str],
+    key_mapping: dict[str, str],
 ) -> None:
-    embedding_sources = (
+    embedding_targets = (
         "model.embed_tokens.weight",
         "model.decoder.embed_tokens.weight",
         "transformer.wte.weight",
@@ -1896,9 +1897,23 @@ def _add_tied_output_fallbacks(
         "embed_out.weight",
         "output.weight",
     )
-    source = next((key for key in embedding_sources if key in weight_map), "")
+
+    mapped_sources: dict[str, str] = {}
+    for source_key in weight_map:
+        mapped_key = _mapped_checkpoint_key(source_key, key_mapping)
+        mapped_sources[mapped_key] = source_key
+
+    source = next(
+        (
+            mapped_sources[target]
+            for target in embedding_targets
+            if target in mapped_sources
+        ),
+        "",
+    )
     if not source:
         return
+
     for target in output_targets:
         if target in state_keys and target not in target_to_source:
             target_to_source[target] = source
