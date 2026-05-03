@@ -13,6 +13,8 @@ from dllm.model import (
     _nested_language_config_dict,
     _parse_device_map,
     _parse_weight_key_mapping,
+    _resolve_checkpoint_source,
+    _safetensor_files,
     _weight_index_sample_keys,
 )
 
@@ -155,6 +157,58 @@ class ModelLoadingOptionsTests(unittest.TestCase):
                 _auto_weight_key_mapping(str(path), offline=True),
                 {r"^layers\.": "model.layers."},
             )
+
+    def test_safetensor_files_include_nested_paths(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            nested = root / "weights"
+            nested.mkdir()
+            (root / "model.safetensors").touch()
+            (nested / "part.safetensors").touch()
+
+            self.assertEqual(
+                [path.relative_to(root).as_posix() for path in _safetensor_files(root)],
+                ["model.safetensors", "weights/part.safetensors"],
+            )
+
+    def test_remote_checkpoint_resolver_downloads_safetensors_when_index_missing(self) -> None:
+        import sys
+        import tempfile
+        import types
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "config.json").write_text("{}", encoding="utf-8")
+            calls: list[tuple[str, ...]] = []
+
+            fake_hub = types.ModuleType("huggingface_hub")
+
+            def snapshot_download(*, repo_id, local_files_only, allow_patterns):
+                del repo_id, local_files_only
+                calls.append(tuple(str(pattern) for pattern in allow_patterns))
+                if len(calls) == 2:
+                    (root / "model.safetensors").touch()
+                return str(root)
+
+            fake_hub.snapshot_download = snapshot_download  # type: ignore[attr-defined]
+            original_hub = sys.modules.get("huggingface_hub")
+            sys.modules["huggingface_hub"] = fake_hub
+            try:
+                source = _resolve_checkpoint_source("example/unindexed", offline=False)
+            finally:
+                if original_hub is None:
+                    sys.modules.pop("huggingface_hub", None)
+                else:
+                    sys.modules["huggingface_hub"] = original_hub
+
+            self.assertEqual(source.root, root)
+            self.assertEqual(len(calls), 2)
+            self.assertNotIn("*.safetensors", calls[0])
+            self.assertIn("*.safetensors", calls[1])
 
 
 if __name__ == "__main__":

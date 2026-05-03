@@ -1638,23 +1638,42 @@ def _resolve_checkpoint_source(model_name: str, *, offline: bool) -> CheckpointS
     except Exception as exc:
         raise RuntimeError("huggingface-hub is required to resolve remote model checkpoints") from exc
 
+    metadata_patterns = [
+        "*.safetensors.index.json",
+        "**/*.safetensors.index.json",
+        "config.json",
+        "generation_config.json",
+    ]
     try:
         resolved = snapshot_download(
             repo_id=model_name,
             local_files_only=offline,
-            allow_patterns=[
-                "*.safetensors.index.json",
-                "**/*.safetensors.index.json",
-                "config.json",
-                "generation_config.json",
-            ],
+            allow_patterns=metadata_patterns,
         )
     except Exception as exc:
         mode = "cached" if offline else "downloaded or cached"
         raise RuntimeError(
             f"could not resolve {mode} safetensors index for {model_name!r}: {exc}"
         ) from exc
-    return CheckpointSource(model_name=model_name, root=Path(resolved), offline=offline, is_remote=True)
+    root = Path(resolved)
+    if _preferred_weight_index_path(root) is None and not _safetensor_files(root):
+        try:
+            resolved = snapshot_download(
+                repo_id=model_name,
+                local_files_only=offline,
+                allow_patterns=[
+                    *metadata_patterns,
+                    "*.safetensors",
+                    "**/*.safetensors",
+                ],
+            )
+        except Exception as exc:
+            mode = "cached" if offline else "downloaded or cached"
+            raise RuntimeError(
+                f"could not resolve {mode} safetensors checkpoint for {model_name!r}: {exc}"
+            ) from exc
+        root = Path(resolved)
+    return CheckpointSource(model_name=model_name, root=root, offline=offline, is_remote=True)
 
 
 def _load_safetensor_shard_weights(
@@ -1805,11 +1824,16 @@ def _safetensor_weight_map(checkpoint: CheckpointSource) -> dict[str, str]:
     except Exception as exc:
         raise RuntimeError("safetensors is required for shard-native loading") from exc
     result: dict[str, str] = {}
-    for file_path in sorted(checkpoint.root.glob("*.safetensors")):
+    for file_path in _safetensor_files(checkpoint.root):
         with safe_open(str(file_path), framework="pt", device="cpu") as handle:
+            filename = file_path.relative_to(checkpoint.root).as_posix()
             for key in handle.keys():
-                result[str(key)] = file_path.name
+                result[str(key)] = filename
     return result
+
+
+def _safetensor_files(root: Path) -> list[Path]:
+    return sorted(path for path in root.rglob("*.safetensors") if path.is_file())
 
 
 def _resolve_checkpoint_file(checkpoint: CheckpointSource, filename: str) -> Path:
