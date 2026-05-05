@@ -126,7 +126,7 @@ class DeviceFlops:
             int8: {self.int8 / self.tflops:.2f} TFLOPS"
 
     def get_flops(self, dtype: str = "fp16", kind: str | None = None) -> float:
-        name = self.device_name.upper()
+        name = self.device_name
         dtype = dtype.lower()
 
         kinds = [kind.upper()] if kind else ["GPU", "CPU"]

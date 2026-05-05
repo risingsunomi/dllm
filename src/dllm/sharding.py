@@ -202,19 +202,6 @@ def _prefill_weighted_spans(
     spans.append(final_span)
     return [int(span) for span in spans]
 
-def _node_flop_weights(
-    node_devices: dict[str, str],
-    *,
-    dtype: str = "fp16",
-) -> dict[str, float]:
-    result: dict[str, float] = {}
-    for node_name, device_name in node_devices.items():
-        result[str(node_name)] = max(
-            float(DeviceFlops(str(device_name)).get_flops(dtype=dtype)),
-            0.01,
-        )
-    return result
-
 
 def total_layers_from_config(config: Any) -> int:
     config_dict = _config_dict(config)
