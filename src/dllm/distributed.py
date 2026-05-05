@@ -181,7 +181,12 @@ class DistributedInferenceEngine:
             peer.last_error = str(exc)
             raise
 
-    def _selected_available_gb(host_info: dict[str, Any] | None, *, fallback: float = 0.0) -> float:
+    def _selected_available_gb(
+        self,
+        host_info: dict[str, Any] | None,
+        *,
+        fallback: float = 0.0,
+    ) -> float:
         if not isinstance(host_info, dict):
             return fallback
 
