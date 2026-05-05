@@ -10,6 +10,7 @@ from .model import TorchTransformersEngine, request_from_payload
 from .model.device_info import collect_host_info, host_weight
 from .peer import PeerClient, _payload_with_prompt
 from .sharding import LayerShard, build_layer_shards, total_layers_from_config
+from .model.devices_flop import DeviceFlops
 
 
 @dataclass
@@ -180,6 +181,51 @@ class DistributedInferenceEngine:
             peer.last_error = str(exc)
             raise
 
+    def _selected_available_gb(host_info: dict[str, Any] | None, *, fallback: float = 0.0) -> float:
+        if not isinstance(host_info, dict):
+            return fallback
+
+        selected = host_info.get("selected")
+        if isinstance(selected, dict):
+            for key in ("available_vram_gb", "available_ram_gb", "vram_gb", "ram_gb"):
+                try:
+                    value = float(selected.get(key, 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    value = 0.0
+                if value > 0:
+                    return value
+
+        devices = host_info.get("devices")
+        if isinstance(devices, list):
+            for device in devices:
+                if not isinstance(device, dict):
+                    continue
+                for key in ("available_vram_gb", "available_ram_gb", "vram_gb", "ram_gb"):
+                    try:
+                        value = float(device.get(key, 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        value = 0.0
+                    if value > 0:
+                        return value
+
+        return fallback
+
+    def _node_available_gb(self) -> dict[str, float]:
+        available: dict[str, float] = {}
+
+        available[self.settings.node_name] = self._selected_available_gb(
+            self.local_device_info,
+            fallback=0.0,
+        )
+
+        for peer in self.peers:
+            available[peer.spec.name] = self._selected_available_gb(
+                peer.device_info,
+                fallback=0.0,
+            )
+
+        return available
+    
     def _plan_shards(self, *, prefill_tokens: int, decode_tokens: int) -> None:
         self.plan_prefill_tokens = max(int(prefill_tokens), 0)
         self.plan_decode_tokens = max(int(decode_tokens), 0)
@@ -201,6 +247,17 @@ class DistributedInferenceEngine:
             prefill_tokens=self.plan_prefill_tokens,
             decode_tokens=self.plan_decode_tokens,
         )
+
+        print("shard plan:", flush=True)
+        for shard in plan:
+            print(
+                f"  {shard.node_name}: "
+                f"{shard.start_layer}:{shard.end_layer} "
+                f"layers={shard.end_layer - shard.start_layer}",
+                flush=True,
+            )
+        print(f"node_weights={self._node_weights()}", flush=True)
+
         if len(plan) <= 1:
             self.local_shard = None
             self.local_engine.set_shard(None)
@@ -228,11 +285,73 @@ class DistributedInferenceEngine:
         if total_layers <= 1:
             raise RuntimeError("model config does not expose num_hidden_layers for sharding")
         return total_layers
+        
+    def _selected_device_name(
+        self,
+        host_info: dict[str, Any] | None,
+        *,
+        fallback: str = "auto",
+    ) -> str:
+        if not isinstance(host_info, dict):
+            return fallback
+
+        selected = host_info.get("selected")
+        if isinstance(selected, dict):
+            name = str(selected.get("name", "") or "").strip()
+            if name:
+                return name
+
+        devices = host_info.get("devices")
+        if isinstance(devices, list):
+            for device in devices:
+                if not isinstance(device, dict):
+                    continue
+                name = str(device.get("name", "") or "").strip()
+                if name:
+                    return name
+
+        return fallback
+    
+    def _flop_dtype(self) -> str:
+        dtype = str(self.settings.dtype or "auto").lower()
+
+        if dtype in {"int8", "8bit"}:
+            return "int8"
+
+        if dtype in {"fp16", "float16", "bf16", "bfloat16", "auto"}:
+            return "fp16"
+
+        return "fp32"
 
     def _node_weights(self) -> list[float]:
-        weights = [host_weight(self.local_device_info, self.settings.device)]
-        for peer in self.peers:
-            weights.append(host_weight(peer.device_info, self.settings.device))
+        weights: list[float] = []
+
+        host_infos = [
+            self.local_device_info,
+            *[peer.device_info for peer in self.peers],
+        ]
+
+        for host_info in host_infos:
+            device_name = self._selected_device_name(
+                host_info,
+                fallback=self.settings.device,
+            )
+
+            flops = DeviceFlops(device_name).get_flops(dtype=self._flop_dtype())
+
+            available_gb = self._selected_available_gb(
+                host_info,
+                fallback=1.0,
+            )
+
+            # Combine compute + capacity without estimating model size.
+            #
+            # sqrt(memory) prevents a huge-RAM CPU from beating a much faster GPU
+            # only because it has more RAM.
+            memory_factor = max(float(available_gb), 1.0) ** 0.5
+
+            weights.append(max(float(flops), 0.01) * memory_factor)
+
         return weights
 
     def _using_shards(self) -> bool:

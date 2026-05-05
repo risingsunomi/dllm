@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from dllm.model.devices_flop import DeviceFlops
+
 
 @dataclass(frozen=True)
 class LayerShard:
@@ -73,6 +75,7 @@ def build_layer_shards(
         return []
 
     names = names[: min(len(names), transformer_layers)]
+        
     weights = _normalized_weights(node_weights, len(names))
     if weights:
         spans = _capacity_weighted_spans(transformer_layers=transformer_layers, weights=weights)
@@ -118,8 +121,12 @@ def _normalized_weights(values: Iterable[float] | None, parts: int) -> list[floa
         return []
     return [weight if weight > 0 else 0.01 for weight in weights]
 
-
-def _capacity_weighted_spans(*, transformer_layers: int, weights: list[float]) -> list[int]:
+def _capacity_weighted_spans(
+    *,
+    transformer_layers: int,
+    weights: list[float],
+    max_layers: list[int] | None = None,
+) -> list[int]:
     parts = len(weights)
     layers = max(int(transformer_layers), 0)
     if parts <= 0:
@@ -129,18 +136,45 @@ def _capacity_weighted_spans(*, transformer_layers: int, weights: list[float]) -
     if layers <= parts:
         return [1 if index < layers else 0 for index in range(parts)]
 
+    if max_layers is None:
+        max_layers = [layers] * parts
+    else:
+        max_layers = [max(int(value), 0) for value in max_layers[:parts]]
+        if len(max_layers) < parts:
+            max_layers.extend([layers] * (parts - len(max_layers)))
+
     total_weight = sum(weights)
     raw = [layers * (weight / total_weight) for weight in weights]
-    spans = [max(1, int(value)) for value in raw]
+
+    spans = [
+        min(max_layers[index], max(1, int(raw[index])))
+        for index in range(parts)
+    ]
+
     while sum(spans) > layers:
-        index = max(range(parts), key=lambda item: (spans[item], -weights[item]))
-        if spans[index] <= 1:
+        candidates = [
+            index for index in range(parts)
+            if spans[index] > 1
+        ]
+        if not candidates:
             break
+        index = max(candidates, key=lambda item: (spans[item], -weights[item]))
         spans[index] -= 1
+
     while sum(spans) < layers:
-        index = max(range(parts), key=lambda item: (raw[item] - spans[item], weights[item]))
+        candidates = [
+            index for index in range(parts)
+            if spans[index] < max_layers[index]
+        ]
+        if not candidates:
+            break
+        index = max(
+            candidates,
+            key=lambda item: (weights[item], raw[item] - spans[item]),
+        )
         spans[index] += 1
-    return spans
+
+    return spans 
 
 
 def _prefill_weighted_spans(
@@ -167,6 +201,19 @@ def _prefill_weighted_spans(
     spans = [base_span + (1 if index < remainder else 0) for index in range(parts - 1)]
     spans.append(final_span)
     return [int(span) for span in spans]
+
+def _node_flop_weights(
+    node_devices: dict[str, str],
+    *,
+    dtype: str = "fp16",
+) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for node_name, device_name in node_devices.items():
+        result[str(node_name)] = max(
+            float(DeviceFlops(str(device_name)).get_flops(dtype=dtype)),
+            0.01,
+        )
+    return result
 
 
 def total_layers_from_config(config: Any) -> int:

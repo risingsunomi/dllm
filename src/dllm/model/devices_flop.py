@@ -119,13 +119,31 @@ class DeviceFlops:
             }   
         }
 
-        def __str__(self):
-            return f"Device: {self.device_name}, \
-                fp32: {self.fp32 / self.tflops:.2f} TFLOPS, \
-                fp16: {self.fp16 / self.tflops:.2f} TFLOPS, \
-                int8: {self.int8 / self.tflops:.2f} TFLOPS"
+    def __str__(self):
+        return f"Device: {self.device_name}, \
+            fp32: {self.fp32 / self.tflops:.2f} TFLOPS, \
+            fp16: {self.fp16 / self.tflops:.2f} TFLOPS, \
+            int8: {self.int8 / self.tflops:.2f} TFLOPS"
 
-    def get_flops(self) -> int:
-        return self.flops
+    def get_flops(self, dtype: str = "fp16", kind: str | None = None) -> float:
+        name = self.device_name.upper()
+        dtype = dtype.lower()
+
+        kinds = [kind.upper()] if kind else ["GPU", "CPU"]
+
+        for device_kind in kinds:
+            table = self.chip_flops.get(device_kind, {})
+            if name in table:
+                flops = table[name]
+                return float(getattr(flops, dtype, flops.fp16))
+
+        # fuzzy fallback: handles names like "NVIDIA GeForce RTX 3060 Laptop GPU"
+        for device_kind in kinds:
+            table = self.chip_flops.get(device_kind, {})
+            for known_name, flops in table.items():
+                if known_name in name or name in known_name:
+                    return float(getattr(flops, dtype, flops.fp16))
+
+        return 1.0
 
     
