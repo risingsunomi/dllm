@@ -89,6 +89,16 @@ DLLM_OFFLOAD_FOLDER=.dllm-offload
 DLLM_ATTENTION_IMPLEMENTATION=sdpa
 ```
 
+For an FP16-only accuracy and throughput test, enable:
+
+```bash
+DLLM_FP16_MODE=true
+```
+
+This forces the runtime dtype to `fp16` even when `DLLM_DTYPE=auto` would choose BF16, and
+sharded hidden states are serialized as FP16 for peer transport. The server also sends the FP16
+mode to workers during shard assignment so all nodes use the same setting.
+
 Distributed MoE example:
 
 ```bash

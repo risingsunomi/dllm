@@ -42,6 +42,7 @@ class Settings:
     discovery_timeout: float = 1.0
     offline: bool = False
     dtype: str = "auto"
+    fp16_mode: bool = False
     trust_remote_code: bool = False
     device_map: str = ""
     offload_folder: str = ""
@@ -58,6 +59,10 @@ class Settings:
     request_timeout: float = 3600.0
     peer_connect_timeout: float = 5.0
     env_file: str = ".env"
+
+    def __post_init__(self) -> None:
+        if self.fp16_mode and str(self.dtype or "").strip().lower() not in {"fp16", "float16"}:
+            object.__setattr__(self, "dtype", "fp16")
 
     @classmethod
     def from_mapping(cls, values: dict[str, Any]) -> "Settings":
@@ -76,6 +81,11 @@ class Settings:
         model_name = str(pick("model_name", "DLLM_MODEL_NAME", "") or "").strip()
         peers_value = pick("peers", "DLLM_PEERS", "") or ""
 
+        fp16_mode = _bool(pick("fp16_mode", "DLLM_FP16_MODE", False), False)
+        dtype = str(pick("dtype", "DLLM_DTYPE", "auto") or "auto")
+        if fp16_mode:
+            dtype = "fp16"
+
         return cls(
             model_name=model_name,
             node_name=str(pick("node_name", "DLLM_NODE_NAME", socket.gethostname()) or socket.gethostname()),
@@ -91,7 +101,8 @@ class Settings:
             discovery_port=_int(pick("discovery_port", "DLLM_DISCOVERY_PORT", 8764), 8764),
             discovery_timeout=_float(pick("discovery_timeout", "DLLM_DISCOVERY_TIMEOUT", 1.0), 1.0),
             offline=_bool(pick("offline", "DLLM_OFFLINE", False), False),
-            dtype=str(pick("dtype", "DLLM_DTYPE", "auto") or "auto"),
+            dtype=dtype,
+            fp16_mode=fp16_mode,
             trust_remote_code=_bool(pick("trust_remote_code", "DLLM_TRUST_REMOTE_CODE", False), False),
             device_map=str(pick("device_map", "DLLM_DEVICE_MAP", "") or ""),
             offload_folder=str(pick("offload_folder", "DLLM_OFFLOAD_FOLDER", "") or ""),

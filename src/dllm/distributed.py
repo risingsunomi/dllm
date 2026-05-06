@@ -56,6 +56,7 @@ class DistributedInferenceEngine:
                 model_name=settings.model_name,
                 device=settings.device,
                 dtype=settings.dtype,
+                fp16_mode=settings.fp16_mode,
                 offline=settings.offline,
                 trust_remote_code=settings.trust_remote_code,
                 device_map=settings.device_map,
@@ -122,6 +123,8 @@ class DistributedInferenceEngine:
             "role": self.settings.role,
             "model_name": self.settings.model_name,
             "device": self.settings.device,
+            "dtype": self.settings.dtype,
+            "fp16_mode": self.settings.fp16_mode,
             "ready": self._ready,
             "runtime": "sharded" if self._using_shards() else "single-node",
             "device_info": self.local_device_info,
@@ -160,6 +163,8 @@ class DistributedInferenceEngine:
                 peer.spec.host,
                 peer.spec.port,
                 model_name=self.settings.model_name,
+                dtype=self.settings.dtype,
+                fp16_mode=self.settings.fp16_mode,
                 offline=self.settings.offline,
                 trust_remote_code=self.settings.trust_remote_code,
                 language_only=self.settings.language_only,
@@ -319,6 +324,8 @@ class DistributedInferenceEngine:
     
     def _flop_dtype(self) -> str:
         dtype = str(self.settings.dtype or "auto").lower()
+        if self.settings.fp16_mode:
+            return "fp16"
 
         if dtype in {"int8", "8bit"}:
             return "int8"

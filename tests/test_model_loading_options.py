@@ -6,6 +6,8 @@ from dllm.model import (
     _add_mxfp4_expert_fallbacks,
     _auto_weight_key_mapping,
     _cast_floating_tensor,
+    _decode_tensor,
+    _encode_tensor,
     _key_mapping_for_prefixes,
     _language_loading_plan,
     _language_weight_prefixes,
@@ -14,6 +16,7 @@ from dllm.model import (
     _nested_language_config_dict,
     _parse_device_map,
     _parse_weight_key_mapping,
+    _resolve_dtype,
     _resolve_checkpoint_source,
     _safetensor_files,
     _weight_index_sample_keys,
@@ -61,6 +64,21 @@ class ModelLoadingOptionsTests(unittest.TestCase):
         tensor = FakeTensor()
         self.assertIs(_cast_floating_tensor(tensor, dtype="bfloat16"), tensor)
         self.assertEqual(tensor.requested_dtype, "bfloat16")
+
+    def test_encode_tensor_can_force_fp16_transport_dtype(self) -> None:
+        import torch
+
+        tensor = torch.ones((1, 2), dtype=torch.float32)
+        payload = _encode_tensor(tensor, dtype=torch.float16)
+        decoded = _decode_tensor(payload, torch, "cpu")
+
+        self.assertEqual(payload["dtype"], "float16")
+        self.assertEqual(decoded.dtype, torch.float16)
+
+    def test_resolve_dtype_accepts_bfp16_alias(self) -> None:
+        import torch
+
+        self.assertIs(_resolve_dtype("bfp16", "cuda", torch), torch.bfloat16)
 
     def test_last_hidden_state_unwraps_nested_tuples(self) -> None:
         class FakeTensor:

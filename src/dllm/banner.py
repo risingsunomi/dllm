@@ -18,7 +18,11 @@ _LOGO = r"""
 
 def startup_banner(settings: Settings, *, peers: tuple[PeerSpec, ...], title: str) -> str:
     lines = [_LOGO.rstrip(), f"dllm v{__version__} | {title} | shard-first distributed inference"]
-    lines.append(f"node={settings.node_name} role={settings.role} device={settings.device} dtype={settings.dtype}")
+    fp16_mode = "on" if settings.fp16_mode else "off"
+    lines.append(
+        f"node={settings.node_name} role={settings.role} "
+        f"device={settings.device} dtype={settings.dtype} fp16_mode={fp16_mode}"
+    )
     selected = collect_host_info().get("selected", {})
     if isinstance(selected, dict) and selected:
         label = selected.get("device") or selected.get("kind") or "device"

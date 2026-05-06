@@ -102,6 +102,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="only use locally cached model files",
     )
     serve.add_argument(
+        "--fp16-mode",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="force FP16 weights, activations, and sharded hidden-state transport",
+    )
+    serve.add_argument(
         "--trust-remote-code",
         action=argparse.BooleanOptionalAction,
         default=None,

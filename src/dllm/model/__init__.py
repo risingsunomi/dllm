@@ -105,6 +105,7 @@ class TorchTransformersEngine:
         device_map: str = "",
         offload_folder: str = "",
         attention_implementation: str = "",
+        fp16_mode: bool = False,
         language_only: bool = True,
         language_weight_prefix: str = "auto",
         weight_key_mapping: str = "",
@@ -118,6 +119,9 @@ class TorchTransformersEngine:
         self.device_map_name = str(device_map or "")
         self.offload_folder = str(offload_folder or "")
         self.attention_implementation = str(attention_implementation or "")
+        self.fp16_mode = bool(fp16_mode)
+        if self.fp16_mode:
+            self.dtype_name = "fp16"
         self.language_only = bool(language_only)
         self.language_weight_prefix = str(language_weight_prefix or "auto")
         self.weight_key_mapping = str(weight_key_mapping or "")
@@ -146,7 +150,11 @@ class TorchTransformersEngine:
             device_choice = resolve_torch_device(self.requested_device, torch)
             device = device_choice.torch_device
             self.selected_device_info = device_choice.info
-            dtype = _resolve_dtype(self.dtype_name, device, torch)
+            dtype = _resolve_dtype(
+                _effective_dtype_name(self.dtype_name, fp16_mode=self.fp16_mode),
+                device,
+                torch,
+            )
             device_map = _parse_device_map(self.device_map_name)
             base_config = transformers.AutoConfig.from_pretrained(
                 self.model_name,
@@ -525,6 +533,7 @@ class TorchTransformersEngine:
         torch = _import_torch()
         request = request_from_payload(payload, {})
         seen_tokens = _int_list(payload.get("seen_tokens", []))
+        transport_dtype = _fp16_transport_dtype(self.fp16_mode, torch)
 
         with self._lock:
             input_ids = _decode_tensor(payload.get("input_ids"), torch, self.input_device)
@@ -564,7 +573,7 @@ class TorchTransformersEngine:
 
                 if not self.shard.is_final:
                     return {
-                        "hidden_state": _encode_tensor(output),
+                        "hidden_state": _encode_tensor(output, dtype=transport_dtype),
                         "attention_mask": _encode_tensor(attention_mask),
                         "position_ids": _encode_tensor(position_ids),
                         "shard": self.shard.as_dict(),
@@ -592,6 +601,7 @@ class TorchTransformersEngine:
             "device": self.device,
             "input_device": self.input_device,
             "dtype": self.dtype_name,
+            "fp16_mode": self.fp16_mode,
             "device_map": self.device_map_name,
             "offload_folder": self.offload_folder,
             "attention_implementation": self.attention_implementation,
@@ -633,17 +643,19 @@ def request_from_payload(payload: dict[str, Any], defaults: dict[str, Any]) -> G
     )
 
 
-def _encode_tensor(tensor: Any) -> dict[str, Any]:
+def _encode_tensor(tensor: Any, *, dtype: Any | None = None) -> dict[str, Any]:
     try:
         from safetensors.torch import save
     except Exception as exc:
         raise RuntimeError("safetensors is required for sharded tensor transport") from exc
-    payload = save({"tensor": tensor.detach().cpu().contiguous()})
+    encoded = tensor.detach()
+    encoded = _cast_floating_tensor(encoded, dtype=dtype)
+    payload = save({"tensor": encoded.cpu().contiguous()})
     return {
         "format": "safetensors",
         "buffer": base64.b64encode(payload).decode("ascii"),
-        "shape": [int(dim) for dim in tensor.shape],
-        "dtype": str(tensor.dtype).replace("torch.", ""),
+        "shape": [int(dim) for dim in encoded.shape],
+        "dtype": str(encoded.dtype).replace("torch.", ""),
     }
 
 
@@ -664,6 +676,12 @@ def _decode_tensor(payload: Any, torch: Any, device: str) -> Any | None:
     if tensor is None:
         return None
     return tensor.to(device)
+
+
+def _fp16_transport_dtype(fp16_mode: bool, torch: Any) -> Any | None:
+    if fp16_mode:
+        return torch.float16
+    return None
 
 
 def _position_ids_from_attention(attention_mask: Any, torch: Any) -> Any:
@@ -1078,7 +1096,7 @@ def _resolve_device(requested: str, torch: Any) -> str:
 
 
 def _resolve_dtype(dtype_name: str, device: str, torch: Any) -> Any | None:
-    name = str(dtype_name or "auto").strip().lower()
+    name = _effective_dtype_name(dtype_name)
     if name in {"", "auto"}:
         if device.startswith("cuda"):
             if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
@@ -1096,10 +1114,17 @@ def _resolve_dtype(dtype_name: str, device: str, torch: Any) -> Any | None:
         "fp16": torch.float16,
         "bfloat16": torch.bfloat16,
         "bf16": torch.bfloat16,
+        "bfp16": torch.bfloat16,
     }
     if name not in mapping:
         raise ValueError(f"unsupported dtype {dtype_name!r}; use auto, fp32, fp16, or bf16")
     return mapping[name]
+
+
+def _effective_dtype_name(dtype_name: str, *, fp16_mode: bool = False) -> str:
+    if fp16_mode:
+        return "fp16"
+    return str(dtype_name or "auto").strip().lower()
 
 
 def _parse_device_map(value: str) -> Any | None:

@@ -63,6 +63,12 @@ class ConfigTests(unittest.TestCase):
         settings = Settings.from_mapping({"model_name": "demo"})
         self.assertEqual(settings.request_timeout, 3600.0)
 
+    def test_fp16_mode_forces_dtype(self) -> None:
+        settings = Settings.from_mapping({"model_name": "demo", "dtype": "auto", "fp16_mode": True})
+        self.assertTrue(settings.fp16_mode)
+        self.assertEqual(settings.dtype, "fp16")
+        self.assertEqual(Settings(model_name="demo", dtype="auto", fp16_mode=True).dtype, "fp16")
+
     def test_server_requires_local_first_shard(self) -> None:
         settings = Settings.from_mapping(
             {

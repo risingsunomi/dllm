@@ -91,6 +91,7 @@ class _FakeWorkerEngine:
         device_map: str = "",
         offload_folder: str = "",
         attention_implementation: str = "",
+        fp16_mode: bool = False,
         language_only: bool = True,
         language_weight_prefix: str = "auto",
         weight_key_mapping: str = "",
@@ -104,6 +105,9 @@ class _FakeWorkerEngine:
         self.device_map_name = device_map
         self.offload_folder = offload_folder
         self.attention_implementation = attention_implementation
+        self.fp16_mode = fp16_mode
+        if self.fp16_mode:
+            self.dtype_name = "fp16"
         self.language_only = language_only
         self.language_weight_prefix = language_weight_prefix
         self.weight_key_mapping = weight_key_mapping
@@ -242,8 +246,28 @@ class DistributedShardingTests(unittest.TestCase):
         self.assertEqual(engine.plan_prefill_tokens, 12)
         self.assertEqual(engine.plan_decode_tokens, 4)
         self.assertEqual(len(peer_client.load_payloads), 1)
+        self.assertEqual(peer_client.load_payloads[0]["payload"]["dtype"], "auto")
+        self.assertFalse(peer_client.load_payloads[0]["payload"]["fp16_mode"])
         self.assertFalse(engine.peers[0].loaded)
         self.assertTrue(engine.peers[0].healthy)
+
+    def test_ensure_ready_sends_fp16_mode_to_peer(self) -> None:
+        settings = Settings(
+            model_name="demo",
+            node_name="server",
+            peers=tuple(parse_peers("node-b@127.0.0.1:8765")),
+            fp16_mode=True,
+            dtype="fp16",
+        )
+        local = _FakeLocalEngine()
+        engine = _PlanningEngine(settings, local_engine=local)  # type: ignore[arg-type]
+        peer_client = _FakePeerClient()
+        engine.peer_client = peer_client  # type: ignore[assignment]
+
+        engine.ensure_ready(prefill_tokens=12, decode_tokens=4)
+
+        self.assertEqual(peer_client.load_payloads[0]["payload"]["dtype"], "fp16")
+        self.assertTrue(peer_client.load_payloads[0]["payload"]["fp16_mode"])
 
     def test_worker_load_model_configures_shard_without_loading_weights(self) -> None:
         original_engine = peer_module.TorchTransformersEngine
@@ -259,6 +283,14 @@ class DistributedShardingTests(unittest.TestCase):
             self.assertFalse(response["payload"]["loaded"])
             self.assertEqual(worker.engine.load_calls, 0)
             self.assertEqual(worker.engine.shard, shard)
+
+            response = worker._handle_load_model(
+                {"model_name": "demo", "fp16_mode": True, "shard": shard.as_dict()}
+            )
+
+            self.assertTrue(response["payload"]["configured"])
+            self.assertTrue(worker.engine.fp16_mode)
+            self.assertEqual(worker.engine.dtype_name, "fp16")
         finally:
             peer_module.TorchTransformersEngine = original_engine  # type: ignore[assignment]
 

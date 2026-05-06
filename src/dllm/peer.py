@@ -44,6 +44,7 @@ class PeerClient:
         model_name: str,
         device: str | None = None,
         dtype: str | None = None,
+        fp16_mode: bool | None = None,
         offline: bool | None = None,
         trust_remote_code: bool | None = None,
         device_map: str | None = None,
@@ -59,6 +60,8 @@ class PeerClient:
             payload["device"] = device
         if dtype:
             payload["dtype"] = dtype
+        if fp16_mode is not None:
+            payload["fp16_mode"] = bool(fp16_mode)
         if offline is not None:
             payload["offline"] = offline
         if trust_remote_code is not None:
@@ -133,6 +136,7 @@ class InferenceWorker:
             model_name=settings.model_name,
             device=settings.device,
             dtype=settings.dtype,
+            fp16_mode=settings.fp16_mode,
             offline=settings.offline,
             trust_remote_code=settings.trust_remote_code,
             device_map=settings.device_map,
@@ -211,6 +215,9 @@ class InferenceWorker:
             requested_model = str(payload.get("model_name") or self.engine.model_name).strip()
             requested_device = str(payload.get("device") or self.engine.requested_device).strip()
             requested_dtype = str(payload.get("dtype") or self.engine.dtype_name).strip()
+            requested_fp16_mode = _bool_payload(payload.get("fp16_mode"), self.engine.fp16_mode)
+            if requested_fp16_mode:
+                requested_dtype = "fp16"
             requested_offline = bool(payload.get("offline", self.engine.offline))
             requested_trust = bool(payload.get("trust_remote_code", self.engine.trust_remote_code))
             requested_device_map = str(payload.get("device_map") or self.engine.device_map_name).strip()
@@ -229,6 +236,7 @@ class InferenceWorker:
                 requested_model == self.engine.model_name
                 and requested_device == self.engine.requested_device
                 and requested_dtype == self.engine.dtype_name
+                and requested_fp16_mode == self.engine.fp16_mode
                 and requested_offline == self.engine.offline
                 and requested_trust == self.engine.trust_remote_code
                 and requested_device_map == self.engine.device_map_name
@@ -245,6 +253,7 @@ class InferenceWorker:
                     model_name=requested_model,
                     device=requested_device,
                     dtype=requested_dtype,
+                    fp16_mode=requested_fp16_mode,
                     offline=requested_offline,
                     trust_remote_code=requested_trust,
                     device_map=requested_device_map,
@@ -396,6 +405,19 @@ def _message_content_to_text(content: Any) -> str:
             return str(content.get("text", ""))
         return json.dumps(content, separators=(",", ":"), default=str)
     return str(content)
+
+
+def _bool_payload(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def _shard_dict(shard: LayerShard | None) -> dict[str, Any] | None:
