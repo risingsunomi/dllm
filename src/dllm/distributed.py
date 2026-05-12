@@ -8,7 +8,7 @@ from typing import Any
 from .config import PeerSpec, Settings
 from .model import TorchTransformersEngine, request_from_payload
 from .model.device_info import collect_host_info, host_weight
-from .peer import PeerClient, _payload_with_prompt
+from .peer import PeerClient, _payload_with_prompt, cleanup_tensor_payloads
 from .sharding import LayerShard, build_layer_shards, total_layers_from_config
 from .model.devices_flop import DeviceFlops
 
@@ -22,6 +22,7 @@ class PeerState:
     last_seen: float = 0.0
     shard: LayerShard | None = None
     device_info: dict[str, Any] | None = None
+    binary_tensors: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -32,6 +33,7 @@ class PeerState:
             "last_seen": self.last_seen,
             "shard": self.shard.as_dict() if self.shard is not None else None,
             "device_info": self.device_info,
+            "binary_tensors": self.binary_tensors,
         }
 
 
@@ -149,6 +151,10 @@ class DistributedInferenceEngine:
                 if not isinstance(device_info, dict):
                     device_info = engine.get("device_info") if isinstance(engine, dict) else None
                 peer.device_info = device_info if isinstance(device_info, dict) else peer.device_info
+                wire_protocol = payload.get("wire_protocol") if isinstance(payload, dict) else None
+                peer.binary_tensors = bool(
+                    isinstance(wire_protocol, dict) and wire_protocol.get("binary_tensors")
+                )
                 peer.loaded = bool(engine.get("loaded", peer.loaded))
                 results.append({"peer": peer.as_dict(), "health": payload})
             except Exception as exc:
@@ -434,7 +440,18 @@ class DistributedInferenceEngine:
                 }
                 result = self.local_engine.forward_shard(stage_payload)
                 for peer in self._shard_peers():
-                    result = self._forward_peer_shard(peer, {**stage_payload, **_next_shard_payload(result)})
+                    next_payload = _next_shard_payload(result)
+                    try:
+                        result = self._forward_peer_shard(
+                            peer,
+                            {
+                                **request_payload,
+                                "seen_tokens": seen_tokens,
+                                **next_payload,
+                            },
+                        )
+                    finally:
+                        cleanup_tensor_payloads(next_payload)
 
                 if "token_id" not in result:
                     raise RuntimeError("sharded inference ended without a final token")
@@ -481,7 +498,12 @@ class DistributedInferenceEngine:
 
     def _forward_peer_shard(self, peer: PeerState, payload: dict[str, Any]) -> dict[str, Any]:
         try:
-            response = self.peer_client.forward_shard(peer.spec.host, peer.spec.port, payload)
+            response = self.peer_client.forward_shard(
+                peer.spec.host,
+                peer.spec.port,
+                payload,
+                binary_tensors=peer.binary_tensors,
+            )
             peer.healthy = True
             peer.loaded = True
             peer.last_error = ""

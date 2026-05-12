@@ -99,6 +99,10 @@ This forces the runtime dtype to `fp16` even when `DLLM_DTYPE=auto` would choose
 sharded hidden states are serialized as FP16 for peer transport. The server also sends the FP16
 mode to workers during shard assignment so all nodes use the same setting.
 
+Peers that advertise binary tensor transport receive hidden states as chunked raw safetensor
+attachments instead of base64 JSON fields. This avoids the base64 size overhead on slow links and
+lets workers spool incoming hidden-state chunks before materializing tensors for shard execution.
+
 Distributed MoE example:
 
 ```bash

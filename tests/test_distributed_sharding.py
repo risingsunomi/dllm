@@ -65,7 +65,15 @@ class _FakePeerClient:
         self.load_payloads.append({"host": host, "port": port, "payload": payload})
         return {"payload": {"configured": True, "loaded": False, "engine": {"loaded": False}}}
 
-    def forward_shard(self, host: str, port: int, payload: dict) -> dict:
+    def forward_shard(
+        self,
+        host: str,
+        port: int,
+        payload: dict,
+        *,
+        binary_tensors: bool = False,
+    ) -> dict:
+        payload = {**payload, "_binary_tensors": binary_tensors}
         self.payloads.append({"host": host, "port": port, "payload": payload})
         return {"payload": {"token_id": 65, "end_token": True}}
 
@@ -330,6 +338,7 @@ class DistributedShardingTests(unittest.TestCase):
         self.assertEqual(result["text"], "A")
         self.assertEqual(result["target"], "sharded")
         self.assertIn("hidden_state", peer_client.payloads[0]["payload"])
+        self.assertNotIn("input_ids", peer_client.payloads[0]["payload"])
         self.assertEqual(len(peer_client.unload_payloads), 1)
         self.assertFalse(engine.peers[0].loaded)
         self.assertEqual(result["shards"][0]["shard"]["start_layer"], 0)

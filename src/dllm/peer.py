@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import base64
 import json
+import os
 import socket
 import socketserver
 import struct
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .config import Settings
@@ -16,12 +20,20 @@ from .sharding import LayerShard
 
 _HEADER = struct.Struct("!Q")
 _MAX_MESSAGE_BYTES = 512 * 1024 * 1024
+_ATTACHMENT_CHUNK_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
 class PeerResponse:
     ok: bool
     payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _OutgoingAttachment:
+    attachment_id: str
+    size: int
+    data: bytes | bytearray | memoryview | Path
 
 
 class PeerProtocolError(RuntimeError):
@@ -90,8 +102,21 @@ class PeerClient:
             timeout=self.timeout,
         )
 
-    def forward_shard(self, host: str, port: int, payload: dict[str, Any]) -> dict[str, Any]:
-        return self.send(host, port, {"command": "forward_shard", "payload": payload}, timeout=self.timeout)
+    def forward_shard(
+        self,
+        host: str,
+        port: int,
+        payload: dict[str, Any],
+        *,
+        binary_tensors: bool = False,
+    ) -> dict[str, Any]:
+        return self.send(
+            host,
+            port,
+            {"command": "forward_shard", "payload": payload},
+            timeout=self.timeout,
+            binary_tensors=binary_tensors,
+        )
 
     def unload_model(self, host: str, port: int, *, reason: str = "generation_done") -> dict[str, Any]:
         return self.send(
@@ -101,26 +126,32 @@ class PeerClient:
             timeout=self.timeout,
         )
 
-    def send(self, host: str, port: int, message: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
-        body = json.dumps(message, separators=(",", ":")).encode("utf-8")
-        if len(body) > _MAX_MESSAGE_BYTES:
-            raise PeerProtocolError("request is too large")
+    def send(
+        self,
+        host: str,
+        port: int,
+        message: dict[str, Any],
+        *,
+        timeout: float | None = None,
+        binary_tensors: bool = False,
+    ) -> dict[str, Any]:
+        wire_message = dict(message)
+        if binary_tensors:
+            wire_message["binary_tensors"] = True
 
         socket_timeout = self.timeout if timeout is None else timeout
         command = str(message.get("command", "request"))
         try:
             with socket.create_connection((host, int(port)), timeout=self.connect_timeout) as sock:
                 sock.settimeout(socket_timeout)
-                sock.sendall(_HEADER.pack(len(body)))
-                sock.sendall(body)
-                response = _read_message(sock)
+                _write_envelope(sock, wire_message, binary_tensors=binary_tensors)
+                decoded = _read_envelope(sock, spool_attachments=binary_tensors)
         except socket.timeout as exc:
             raise TimeoutError(
                 f"peer {command} timed out after {socket_timeout:g}s; "
                 "increase --request-timeout/DLLM_REQUEST_TIMEOUT for first loads of large checkpoints"
             ) from exc
 
-        decoded = json.loads(response.decode("utf-8"))
         if not isinstance(decoded, dict):
             raise PeerProtocolError("peer returned a non-object response")
         if decoded.get("ok") is False:
@@ -206,6 +237,10 @@ class InferenceWorker:
             "uptime_seconds": time.time() - self.started_at,
             "host": self.settings.peer_host,
             "port": self.settings.peer_port,
+            "wire_protocol": {
+                "binary_tensors": True,
+                "attachment_chunk_bytes": _ATTACHMENT_CHUNK_BYTES,
+            },
             "device_info": engine_health.get("device_info"),
             "engine": engine_health,
         }
@@ -314,18 +349,24 @@ class InferenceWorker:
 
         class Handler(socketserver.BaseRequestHandler):
             def handle(self) -> None:
+                message: dict[str, Any] = {}
                 try:
-                    raw = _read_message(self.request)
-                    message = json.loads(raw.decode("utf-8"))
+                    message = _read_envelope(self.request, spool_attachments=True)
                     if not isinstance(message, dict):
                         raise PeerProtocolError("request must be a JSON object")
                     response = worker.dispatch(message)
                 except Exception as exc:
                     response = {"ok": False, "error": str(exc)}
                 try:
-                    _write_message(self.request, json.dumps(response, separators=(",", ":")).encode("utf-8"))
+                    _write_envelope(
+                        self.request,
+                        response,
+                        binary_tensors=bool(message.get("binary_tensors")),
+                    )
                 except (BrokenPipeError, ConnectionResetError):
                     return
+                finally:
+                    cleanup_tensor_payloads(message)
 
         server = _ThreadingTCPServer((self.settings.peer_host, self.settings.peer_port), Handler)
         server.worker = self  # type: ignore[attr-defined]
@@ -381,6 +422,84 @@ def _read_message(sock: socket.socket) -> bytes:
     return _read_exact(sock, size)
 
 
+def _read_envelope(sock: socket.socket, *, spool_attachments: bool) -> dict[str, Any]:
+    raw = _read_message(sock)
+    message = json.loads(raw.decode("utf-8"))
+    if not isinstance(message, dict):
+        raise PeerProtocolError("message must be a JSON object")
+
+    descriptors = message.pop("attachments", [])
+    if not descriptors:
+        return message
+    if not isinstance(descriptors, list):
+        raise PeerProtocolError("attachments must be a list")
+
+    received: dict[str, dict[str, Any]] = {}
+    for descriptor in descriptors:
+        if not isinstance(descriptor, dict):
+            raise PeerProtocolError("attachment descriptor must be an object")
+        attachment_id = str(descriptor.get("id", "")).strip()
+        expected_size = _int_payload(descriptor.get("size"), -1)
+        if not attachment_id or expected_size < 0:
+            raise PeerProtocolError("attachment descriptor is missing id or size")
+        received[attachment_id] = _read_attachment(sock, expected_size, spool=spool_attachments)
+
+    return _hydrate_attachment_placeholders(message, received)
+
+
+def _write_envelope(sock: socket.socket, message: dict[str, Any], *, binary_tensors: bool) -> None:
+    if binary_tensors:
+        wire_message, attachments = _extract_tensor_attachments(message)
+    else:
+        wire_message = _inline_tensor_buffers(message)
+        attachments = []
+
+    if attachments:
+        wire_message = dict(wire_message)
+        wire_message["attachments"] = [
+            {"id": attachment.attachment_id, "size": attachment.size}
+            for attachment in attachments
+        ]
+
+    body = json.dumps(wire_message, separators=(",", ":")).encode("utf-8")
+    _write_message(sock, body)
+    for attachment in attachments:
+        _write_attachment(sock, attachment)
+
+
+def _read_attachment(sock: socket.socket, expected_size: int, *, spool: bool) -> dict[str, Any]:
+    header = _read_exact(sock, _HEADER.size)
+    if len(header) != _HEADER.size:
+        raise PeerProtocolError("missing attachment header")
+    size = _HEADER.unpack(header)[0]
+    if size != expected_size:
+        raise PeerProtocolError("attachment size did not match descriptor")
+    if size > _MAX_MESSAGE_BYTES:
+        raise PeerProtocolError("attachment is too large")
+
+    if not spool:
+        return {"buffer": _read_exact(sock, size)}
+
+    handle = tempfile.NamedTemporaryFile(prefix="dllm-tensor-", suffix=".safetensors", delete=False)
+    path = handle.name
+    remaining = size
+    try:
+        with handle:
+            while remaining > 0:
+                chunk = sock.recv(min(_ATTACHMENT_CHUNK_BYTES, remaining))
+                if not chunk:
+                    raise PeerProtocolError("socket closed while reading attachment")
+                handle.write(chunk)
+                remaining -= len(chunk)
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return {"buffer_path": path, "_temporary_file": True}
+
+
 def _message_content_to_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -420,15 +539,41 @@ def _bool_payload(value: Any, default: bool) -> bool:
     return default
 
 
+def _int_payload(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _shard_dict(shard: LayerShard | None) -> dict[str, Any] | None:
     return shard.as_dict() if shard is not None else None
 
 
 def _write_message(sock: socket.socket, body: bytes) -> None:
     if len(body) > _MAX_MESSAGE_BYTES:
-        raise PeerProtocolError("response is too large")
+        raise PeerProtocolError("message is too large")
     sock.sendall(_HEADER.pack(len(body)))
     sock.sendall(body)
+
+
+def _write_attachment(sock: socket.socket, attachment: _OutgoingAttachment) -> None:
+    if attachment.size > _MAX_MESSAGE_BYTES:
+        raise PeerProtocolError("attachment is too large")
+    sock.sendall(_HEADER.pack(attachment.size))
+    data = attachment.data
+    if isinstance(data, Path):
+        with data.open("rb") as handle:
+            while True:
+                chunk = handle.read(_ATTACHMENT_CHUNK_BYTES)
+                if not chunk:
+                    break
+                sock.sendall(chunk)
+        return
+
+    view = memoryview(data)
+    for offset in range(0, len(view), _ATTACHMENT_CHUNK_BYTES):
+        sock.sendall(view[offset : offset + _ATTACHMENT_CHUNK_BYTES])
 
 
 def _read_exact(sock: socket.socket, size: int) -> bytes:
@@ -441,3 +586,115 @@ def _read_exact(sock: socket.socket, size: int) -> bytes:
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
+
+
+def _extract_tensor_attachments(value: Any) -> tuple[Any, list[_OutgoingAttachment]]:
+    attachments: list[_OutgoingAttachment] = []
+
+    def visit(item: Any) -> Any:
+        tensor_buffer = _tensor_buffer_for_attachment(item)
+        if tensor_buffer is not None:
+            attachment_id = f"tensor-{len(attachments)}"
+            replacement = {
+                key: visit(value)
+                for key, value in item.items()
+                if key not in {"buffer", "buffer_path", "_temporary_file"}
+            }
+            replacement["attachment"] = attachment_id
+            attachments.append(
+                _OutgoingAttachment(
+                    attachment_id=attachment_id,
+                    size=_tensor_buffer_size(tensor_buffer),
+                    data=tensor_buffer,
+                )
+            )
+            return replacement
+        if isinstance(item, dict):
+            return {key: visit(value) for key, value in item.items()}
+        if isinstance(item, list):
+            return [visit(value) for value in item]
+        return item
+
+    return visit(value), attachments
+
+
+def _hydrate_attachment_placeholders(value: Any, received: dict[str, dict[str, Any]]) -> Any:
+    if isinstance(value, dict):
+        attachment_id = value.get("attachment")
+        if isinstance(attachment_id, str) and attachment_id in received:
+            hydrated = {
+                key: _hydrate_attachment_placeholders(item, received)
+                for key, item in value.items()
+                if key != "attachment"
+            }
+            hydrated.update(received[attachment_id])
+            return hydrated
+        return {key: _hydrate_attachment_placeholders(item, received) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_hydrate_attachment_placeholders(item, received) for item in value]
+    return value
+
+
+def _inline_tensor_buffers(value: Any) -> Any:
+    tensor_buffer = _tensor_buffer_for_attachment(value)
+    if tensor_buffer is not None:
+        inlined = {
+            key: _inline_tensor_buffers(item)
+            for key, item in value.items()
+            if key not in {"buffer", "buffer_path", "_temporary_file"}
+        }
+        inlined["buffer"] = base64.b64encode(_tensor_buffer_bytes(tensor_buffer)).decode("ascii")
+        return inlined
+    if isinstance(value, dict):
+        return {key: _inline_tensor_buffers(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_inline_tensor_buffers(item) for item in value]
+    return value
+
+
+def _tensor_buffer_for_attachment(value: Any) -> bytes | bytearray | memoryview | Path | None:
+    if not isinstance(value, dict):
+        return None
+    if value.get("format") != "safetensors":
+        return None
+
+    buffer = value.get("buffer")
+    if isinstance(buffer, (bytes, bytearray, memoryview)):
+        return buffer
+    if isinstance(buffer, str) and buffer:
+        return base64.b64decode(buffer.encode("ascii"))
+
+    buffer_path = value.get("buffer_path")
+    if isinstance(buffer_path, str) and buffer_path:
+        return Path(buffer_path)
+    return None
+
+
+def _tensor_buffer_size(buffer: bytes | bytearray | memoryview | Path) -> int:
+    if isinstance(buffer, Path):
+        return int(buffer.stat().st_size)
+    return len(buffer)
+
+
+def _tensor_buffer_bytes(buffer: bytes | bytearray | memoryview | Path) -> bytes:
+    if isinstance(buffer, Path):
+        return buffer.read_bytes()
+    return bytes(buffer)
+
+
+def cleanup_tensor_payloads(value: Any) -> None:
+    if isinstance(value, dict):
+        buffer_path = value.get("buffer_path")
+        if value.get("_temporary_file") and isinstance(buffer_path, str) and buffer_path:
+            try:
+                os.unlink(buffer_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        for item in value.values():
+            cleanup_tensor_payloads(item)
+        return
+    if isinstance(value, list):
+        for item in value:
+            cleanup_tensor_payloads(item)

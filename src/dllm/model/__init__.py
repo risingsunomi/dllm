@@ -484,9 +484,9 @@ class TorchTransformersEngine:
                 attention_mask = attention_mask.to(self.input_device, dtype=torch.long)
             position_ids = _position_ids_from_attention(attention_mask, torch)
             return {
-                "input_ids": _encode_tensor(input_ids),
-                "attention_mask": _encode_tensor(attention_mask),
-                "position_ids": _encode_tensor(position_ids),
+                "input_ids": _encode_tensor(input_ids, raw=True),
+                "attention_mask": _encode_tensor(attention_mask, raw=True),
+                "position_ids": _encode_tensor(position_ids, raw=True),
                 "prompt_tokens": int(input_ids.shape[-1]),
                 "seen_tokens": [int(value) for value in input_ids.detach().cpu().reshape(-1).tolist()],
             }
@@ -504,9 +504,9 @@ class TorchTransformersEngine:
             attention_mask = torch.cat((attention_mask.to(dtype=torch.long), next_mask), dim=1)
             position_ids = _position_ids_from_attention(attention_mask, torch)
             return {
-                "input_ids": _encode_tensor(input_ids),
-                "attention_mask": _encode_tensor(attention_mask),
-                "position_ids": _encode_tensor(position_ids),
+                "input_ids": _encode_tensor(input_ids, raw=True),
+                "attention_mask": _encode_tensor(attention_mask, raw=True),
+                "position_ids": _encode_tensor(position_ids, raw=True),
                 "prompt_tokens": int(encoded_inputs.get("prompt_tokens", input_ids.shape[-1])),
                 "seen_tokens": [int(value) for value in input_ids.detach().cpu().reshape(-1).tolist()],
             }
@@ -573,9 +573,9 @@ class TorchTransformersEngine:
 
                 if not self.shard.is_final:
                     return {
-                        "hidden_state": _encode_tensor(output, dtype=transport_dtype),
-                        "attention_mask": _encode_tensor(attention_mask),
-                        "position_ids": _encode_tensor(position_ids),
+                        "hidden_state": _encode_tensor(output, dtype=transport_dtype, raw=True),
+                        "attention_mask": _encode_tensor(attention_mask, raw=True),
+                        "position_ids": _encode_tensor(position_ids, raw=True),
                         "shard": self.shard.as_dict(),
                         "elapsed_seconds": elapsed,
                     }
@@ -643,7 +643,7 @@ def request_from_payload(payload: dict[str, Any], defaults: dict[str, Any]) -> G
     )
 
 
-def _encode_tensor(tensor: Any, *, dtype: Any | None = None) -> dict[str, Any]:
+def _encode_tensor(tensor: Any, *, dtype: Any | None = None, raw: bool = False) -> dict[str, Any]:
     try:
         from safetensors.torch import save
     except Exception as exc:
@@ -651,27 +651,41 @@ def _encode_tensor(tensor: Any, *, dtype: Any | None = None) -> dict[str, Any]:
     encoded = tensor.detach()
     encoded = _cast_floating_tensor(encoded, dtype=dtype)
     payload = save({"tensor": encoded.cpu().contiguous()})
-    return {
+    encoded_payload: dict[str, Any] = {
         "format": "safetensors",
-        "buffer": base64.b64encode(payload).decode("ascii"),
         "shape": [int(dim) for dim in encoded.shape],
         "dtype": str(encoded.dtype).replace("torch.", ""),
     }
+    if raw:
+        encoded_payload["buffer"] = payload
+    else:
+        encoded_payload["buffer"] = base64.b64encode(payload).decode("ascii")
+    return encoded_payload
 
 
 def _decode_tensor(payload: Any, torch: Any, device: str) -> Any | None:
     if not isinstance(payload, dict):
         return None
     buffer = payload.get("buffer")
-    if not isinstance(buffer, str) or not buffer:
-        return None
+    buffer_path = payload.get("buffer_path")
     if str(payload.get("format", "safetensors")) != "safetensors":
         raise ValueError("unsupported tensor payload format")
     try:
+        from safetensors import safe_open
         from safetensors.torch import load
     except Exception as exc:
         raise RuntimeError("safetensors is required for sharded tensor transport") from exc
-    tensors = load(base64.b64decode(buffer.encode("ascii")))
+    if isinstance(buffer_path, str) and buffer_path:
+        with safe_open(buffer_path, framework="pt", device="cpu") as handle:
+            tensor = handle.get_tensor("tensor")
+        return tensor.to(device)
+    if isinstance(buffer, str) and buffer:
+        raw = base64.b64decode(buffer.encode("ascii"))
+    elif isinstance(buffer, (bytes, bytearray, memoryview)):
+        raw = bytes(buffer)
+    else:
+        return None
+    tensors = load(raw)
     tensor = tensors.get("tensor")
     if tensor is None:
         return None

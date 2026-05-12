@@ -75,6 +75,16 @@ class ModelLoadingOptionsTests(unittest.TestCase):
         self.assertEqual(payload["dtype"], "float16")
         self.assertEqual(decoded.dtype, torch.float16)
 
+    def test_encode_tensor_can_return_raw_transport_buffer(self) -> None:
+        import torch
+
+        tensor = torch.arange(6, dtype=torch.float32).reshape(1, 2, 3)
+        payload = _encode_tensor(tensor, raw=True)
+        decoded = _decode_tensor(payload, torch, "cpu")
+
+        self.assertIsInstance(payload["buffer"], bytes)
+        self.assertTrue(torch.equal(decoded, tensor))
+
     def test_resolve_dtype_accepts_bfp16_alias(self) -> None:
         import torch
 
